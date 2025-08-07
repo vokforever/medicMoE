@@ -1,31 +1,26 @@
-FROM python:3.11-slim
+FROM python:3.11-slim as builder
 
 # Установка системных зависимостей
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Установка рабочей директории
+# Настройка окружения
+ENV PIP_DEFAULT_TIMEOUT=1000 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
-
-# Копирование requirements.txt
 COPY requirements.txt .
+RUN pip install --user --no-cache-dir -r requirements.txt
 
-# Установка Python зависимостей
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Копирование исходного кода
+# Финальный образ
+FROM python:3.11-slim
+WORKDIR /app
+COPY --from=builder /root/.local /home/app/.local
 COPY . .
-
-# Создание директории для логов
-RUN mkdir -p logs
-
-# Установка прав на выполнение
-RUN chmod +x main.py
-
-# Порт для暴露
+RUN mkdir -p logs && chmod +x main.py
 EXPOSE 8080
-
-# Команда запуска
 CMD ["python", "main.py"]
