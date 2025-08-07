@@ -348,6 +348,7 @@ def get_main_keyboard():
 
 # Функция для получения эмбеддинга
 def get_embedding(text: str) -> List[float]:
+    """Получение эмбеддинга текста с помощью Mistral AI"""
     try:
         headers = {
             "Authorization": f"Bearer {os.getenv('MISTRAL_API_KEY')}",
@@ -366,6 +367,7 @@ def get_embedding(text: str) -> List[float]:
 
 # Функция для косинусного сходства
 def cosine_similarity(a: List[float], b: List[float]) -> float:
+    """Вычисление косинусного сходства между двумя векторами"""
     try:
         a = np.array(a)
         b = np.array(b)
@@ -375,36 +377,47 @@ def cosine_similarity(a: List[float], b: List[float]) -> float:
 
 # Функция для векторного поиска
 def vector_search(query: str, threshold: float = 0.7) -> List[Tuple[str, str, float]]:
+    """Поиск похожих вопросов в векторной базе знаний"""
     try:
         query_embedding = get_embedding(query)
         if not query_embedding:
             return []
         
+        # Получаем все записи с эмбеддингами
         response = supabase.table("doc_knowledge_base_vector").select("*").execute()
         
         results = []
         for item in response.data:
             if item.get("embedding"):
-                similarity = cosine_similarity(query_embedding, item["embedding"])
-                if similarity >= threshold:
-                    results.append((item["question"], item["answer"], similarity))
+                # Конвертируем строку JSON обратно в список
+                try:
+                    item_embedding = json.loads(item["embedding"])
+                    similarity = cosine_similarity(query_embedding, item_embedding)
+                    if similarity >= threshold:
+                        results.append((item["question"], item["answer"], similarity))
+                except (json.JSONDecodeError, TypeError):
+                    continue
         
+        # Сортируем по схожести
         results.sort(key=lambda x: x[2], reverse=True)
-        return results[:3]
+        return results[:3]  # Возвращаем топ-3 результата
     except Exception as e:
         logging.error(f"Ошибка при векторном поиске: {e}")
         return []
 
 # Функция для сохранения в векторную базу знаний
 def save_to_vector_knowledge_base(question: str, answer: str, source: str = ""):
+    """Сохранение вопроса и ответа с эмбеддингом"""
     try:
         embedding = get_embedding(question)
         if embedding:
+            # Конвертируем эмбеддинг в строку JSON для сохранения
+            embedding_json = json.dumps(embedding)
             supabase.table("doc_knowledge_base_vector").insert({
                 "question": question,
                 "answer": answer,
                 "source": source,
-                "embedding": embedding,
+                "embedding": embedding_json,
                 "created_at": datetime.now().isoformat()
             }).execute()
     except Exception as e:
