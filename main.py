@@ -250,15 +250,20 @@ async def generate_answer_with_failover(
             messages = [
                 {
                     "role": "system",
-                    "content": """Ты — ИИ-ассистент врача. Твоя задача — помогать пользователям с медицинскими вопросами, 
+                    "content": f"""Ты — ИИ-ассистент врача. Твоя задача — помогать пользователям с медицинскими вопросами, 
                     анализировать их анализы и предоставлять информацию о здоровье. Отвечай максимально точно и информативно, 
                     используя предоставленный контекст. Учитывай историю диалога и данные пациента, если они доступны.
+                    
+                    ТЕКУЩАЯ ДАТА: {datetime.now().strftime('%d.%m.%Y')} (год: {datetime.now().year})
+                    
                     ВАЖНО: Ты не ставишь диагноз и не заменяешь консультацию врача. Всегда рекомендуй консультацию 
                     со специалистом для точной диагностики и лечения.
                     Если в контексте есть точный ответ из авторитетных медицинских источников — используй его.
                     Всегда указывай источник информации, если он известен.
                     Отвечай на русском языке.
-                    Структурируй ответ с использованием эмодзи для лучшего восприятия."""
+                    Структурируй ответ с использованием эмодзи для лучшего восприятия.
+                    
+                    При работе с возрастом пациента учитывай текущую дату и корректируй возраст соответствующим образом."""
                 }
             ]
 
@@ -402,7 +407,10 @@ class TestAnalysisAgent:
                 messages=[
                     {
                         "role": "system",
-                        "content": """Ты — медицинский эксперт по анализам. Извлеки из текста все результаты анализов в структурированном формате.
+                        "content": f"""Ты — медицинский эксперт по анализам. Извлеки из текста все результаты анализов в структурированном формате.
+                        
+                        ТЕКУЩАЯ ДАТА: {datetime.now().strftime('%d.%m.%Y')} (год: {datetime.now().year})
+                        
                         Для каждого анализа укажи:
                         1. Название анализа (на русском)
                         2. Значение
@@ -410,9 +418,12 @@ class TestAnalysisAgent:
                         4. Единицы измерения
                         5. Дату анализа (если есть)
                         6. Отклонение от нормы (если есть)
+                        
+                        При извлечении возраста пациента учитывай текущую дату и корректируй возраст соответствующим образом.
+                        
                         Верни ответ в формате JSON массива объектов:
                         [
-                            {
+                            {{
                                 "test_name": "Название анализа",
                                 "value": "Значение",
                                 "reference_range": "Референсные значения",
@@ -420,7 +431,7 @@ class TestAnalysisAgent:
                                 "test_date": "ГГГГ-ММ-ДД",
                                 "is_abnormal": true/false,
                                 "notes": "Примечания"
-                            }
+                            }}
                         ]
                         Если даты нет, укажи null. Если референсные значения не указаны, укажи null."""
                     },
@@ -772,9 +783,18 @@ async def extract_patient_data_from_text(text: str) -> Dict[str, Any]:
             messages=[
                 {
                     "role": "system",
-                    "content": """Ты — помощник, который извлекает данные пациента из медицинских документов. 
-                    Извлеки имя, возраст и пол, если они есть. Верни ответ в формате JSON: 
-                    {"name": "имя", "age": число, "gender": "М" или "Ж"}. 
+                    "content": f"""Ты — помощник, который извлекает данные пациента из медицинских документов. 
+                    
+                    ТЕКУЩАЯ ДАТА: {datetime.now().strftime('%d.%m.%Y')} (год: {datetime.now().year})
+                    
+                    Извлеки имя, возраст и пол, если они есть. 
+                    
+                    ВАЖНО: При извлечении возраста учитывай текущую дату. Если в документе указан возраст 
+                    "33 года", а сейчас {datetime.now().year} год, то возраст пациента сейчас больше 33 лет.
+                    Корректируй возраст в зависимости от того, когда был создан документ.
+                    
+                    Верни ответ в формате JSON: 
+                    {{"name": "имя", "age": число, "gender": "М" или "Ж"}}. 
                     Если каких-то данных нет, поставь null."""
                 },
                 {
@@ -789,9 +809,16 @@ async def extract_patient_data_from_text(text: str) -> Dict[str, Any]:
             if json_match:
                 json_str = json_match.group(0)
                 data = json.loads(json_str)
+                
+                # Вычисляем текущий возраст на основе извлеченного возраста
+                extracted_age = data.get("age")
+                current_age = None
+                if extracted_age and isinstance(extracted_age, int):
+                    current_age = calculate_current_age(extracted_age)
+                
                 return {
                     "name": data.get("name"),
-                    "age": data.get("age"),
+                    "age": current_age,
                     "gender": data.get("gender")
                 }
         except json.JSONDecodeError:
@@ -802,14 +829,47 @@ async def extract_patient_data_from_text(text: str) -> Dict[str, Any]:
         age_match = re.search(r'(?:Возраст|Лет):\s*(\d+)', text)
         gender_match = re.search(r'(?:Пол):\s*([МЖ])', text)
 
+        extracted_age = int(age_match.group(1)) if age_match else None
+        current_age = calculate_current_age(extracted_age) if extracted_age else None
+
         return {
             "name": name_match.group(1).strip() if name_match else None,
-            "age": int(age_match.group(1)) if age_match else None,
+            "age": current_age,
             "gender": gender_match.group(1) if gender_match else None
         }
     except Exception as e:
         logging.error(f"Ошибка при извлечении данных пациента: {e}")
         return {}
+
+
+# Функция для вычисления текущего возраста на основе указанного возраста
+def calculate_current_age(extracted_age: int) -> int:
+    """
+    Вычисляет текущий возраст на основе указанного возраста в документе.
+    Предполагается, что указанный возраст был актуален на момент создания документа.
+    """
+    try:
+        current_year = datetime.now().year
+        # Предполагаем, что документ мог быть создан в течение последних 5 лет
+        # и вычисляем примерный год рождения
+        estimated_birth_year = current_year - extracted_age
+        
+        # Если год рождения кажется нереалистичным (до 1900), 
+        # считаем что возраст указан для текущего года
+        if estimated_birth_year < 1900:
+            return extracted_age
+        
+        # Вычисляем текущий возраст
+        current_age = current_year - estimated_birth_year
+        
+        # Проверяем разумность результата
+        if current_age < 0 or current_age > 120:
+            return extracted_age
+        
+        return current_age
+    except Exception as e:
+        logging.error(f"Ошибка при вычислении возраста: {e}")
+        return extracted_age
 
 
 # Функция для анализа изображения
