@@ -1980,7 +1980,11 @@ async def handle_message(message: types.Message, state: FSMContext):
         Всегда указывай конкретные значения, референсные диапазоны и интерпретацию результатов.
         
         ИНСТРУКЦИЯ: Когда пользователь спрашивает о конкретном показателе, сначала найди его в результатах анализов, 
-        затем дай подробный ответ с указанием значения, референсного диапазона и медицинской интерпретации."""
+        затем дай подробный ответ с указанием значения, референсного диапазона и медицинской интерпретации.
+        
+        ПРИМЕР ОТВЕТА: По результатам ваших анализов, показатель anti-HEV IgG: ОТРИЦАТЕЛЬНО. 
+        Это означает, что у вас не обнаружены антитела к вирусу гепатита E, что является нормальным результатом 
+        и указывает на отсутствие инфекции этим вирусом."""
         mode_indicator = "👨‍⚕️ ИИ-врач главный"
     else:
         system_prompt = """Ты — ИИ-ассистент врача, который помогает собрать информацию и подготовить данные для консультации. 
@@ -1991,32 +1995,41 @@ async def handle_message(message: types.Message, state: FSMContext):
         Если спрашивают о конкретном показателе, найди этот показатель в результатах и дай подробный ответ."""
         mode_indicator = "👩‍⚕️ ИИ-ассистент врача"
     
-    # 1. Сначала ищем в авторитетных медицинских источниках
-    medical_context = await search_medical_sources(question)
-    if medical_context:
-        await processing_msg.edit_text(f"📚 Найдено в медицинских источниках. Генерирую ответ... ({mode_indicator})")
+    # Приоритетная обработка для конкретных результатов анализов
+    if is_specific_test_query and test_context:
+        # Если спрашивают о конкретных результатах и у нас есть данные - отвечаем сразу
+        await processing_msg.edit_text(f"📊 Анализирую ваши результаты анализов... ({mode_indicator})")
         answer, provider, metadata = await generate_answer_with_failover(
-            question, medical_context + test_context, history, profile, str(user_id), system_prompt
+            question, test_context, history, profile, str(user_id), system_prompt
         )
-        source = "авторитетных медицинских источников"
+        source = "ваших результатов анализов"
     else:
-        # 2. Если не нашли в медицинских источниках, ищем в своей базе знаний
-        await processing_msg.edit_text(f"🗂️ Ищу в накопленной базе знаний... ({mode_indicator})")
-        kb_context = search_knowledge_base(question)
-        if kb_context:
-            await processing_msg.edit_text(f"💡 Найдено в базе знаний. Генерирую ответ... ({mode_indicator})")
+        # 1. Сначала ищем в авторитетных медицинских источниках
+        medical_context = await search_medical_sources(question)
+        if medical_context:
+            await processing_msg.edit_text(f"📚 Найдено в медицинских источниках. Генерирую ответ... ({mode_indicator})")
             answer, provider, metadata = await generate_answer_with_failover(
-                question, kb_context + test_context, history, profile, str(user_id), system_prompt
+                question, medical_context + test_context, history, profile, str(user_id), system_prompt
             )
-            source = "накопленной базы знаний"
+            source = "авторитетных медицинских источников"
         else:
-            # 3. Если нигде не нашли, ищем в интернете
-            await processing_msg.edit_text(f"🌐 Ищу дополнительную информацию в интернете... ({mode_indicator})")
-            web_context = await search_web(f"{question} медицина здоровье")
-            answer, provider, metadata = await generate_answer_with_failover(
-                question, web_context + test_context, history, profile, str(user_id), system_prompt
-            )
-            source = "интернета"
+            # 2. Если не нашли в медицинских источниках, ищем в своей базе знаний
+            await processing_msg.edit_text(f"🗂️ Ищу в накопленной базе знаний... ({mode_indicator})")
+            kb_context = search_knowledge_base(question)
+            if kb_context:
+                await processing_msg.edit_text(f"💡 Найдено в базе знаний. Генерирую ответ... ({mode_indicator})")
+                answer, provider, metadata = await generate_answer_with_failover(
+                    question, kb_context + test_context, history, profile, str(user_id), system_prompt
+                )
+                source = "накопленной базы знаний"
+            else:
+                # 3. Если нигде не нашли, ищем в интернете
+                await processing_msg.edit_text(f"🌐 Ищу дополнительную информацию в интернете... ({mode_indicator})")
+                web_context = await search_web(f"{question} медицина здоровье")
+                answer, provider, metadata = await generate_answer_with_failover(
+                    question, web_context + test_context, history, profile, str(user_id), system_prompt
+                )
+                source = "интернета"
     
     await processing_msg.delete()
     history.append({"role": "assistant", "content": answer})
