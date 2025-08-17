@@ -11,4 +11,8 @@ PyPDF2==3.0.1
 numpy==1.26.2
 asyncio-throttle==1.0.2
 python-dateutil==2.8.2
+<<<<<<< HEAD
 pytz==2023.3
+=======
+pytz==2023.3
+>>>>>>> 1f4e21d (Initial commit)

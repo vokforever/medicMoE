@@ -37,7 +37,7 @@ dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
 # OpenRouter
-openai_client = OpenAI(
+openrouter_client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=os.getenv("OPENROUTER_API_KEY"),
 )
@@ -58,6 +58,68 @@ MEDICAL_SOURCES = [
     "https://www.webmd.com",
     "https://www.mayoclinic.org"
 ]
+
+# Конфигурация моделей для failover
+MODEL_CONFIG = {
+    "openrouter": {
+        "api_key": os.getenv("OPENROUTER_API_KEY"),
+        "base_url": "https://openrouter.ai/api/v1",
+        "models": [
+            {"name": "deepseek/deepseek-chat-v3-0324:free", "priority": 1},
+            {"name": "deepseek/deepseek-r1-0528:free", "priority": 2},
+            {"name": "openai/gpt-oss-20b:free", "priority": 3},
+            {"name": "z-ai/glm-4.5-air:free", "priority": 4},
+            {"name": "moonshotai/kimi-k2:free", "priority": 5}
+        ],
+        "client": openrouter_client
+    },
+    "cerebras": {
+        "api_key": os.getenv("CEREBRAS_API_KEY"),
+        "base_url": "https://api.cerebras.ai/v1",
+        "models": [
+            {"name": "qwen-3-235b-thinking", "priority": 1}
+        ],
+        "client": None  # Будет инициализирован позже
+    },
+    "groq": {
+        "api_key": os.getenv("GROQ_API_KEY"),
+        "base_url": "https://api.groq.com/openai/v1",
+        "models": [
+            {"name": "deepseek-r1-distill-llama-70b", "priority": 1},
+            {"name": "openai/gpt-oss-120b", "priority": 2}
+        ],
+        "client": None  # Будет инициализирован позже
+    }
+}
+
+# Инициализация клиентов для Cerebras и Groq
+if MODEL_CONFIG["cerebras"]["api_key"]:
+    MODEL_CONFIG["cerebras"]["client"] = OpenAI(
+        base_url=MODEL_CONFIG["cerebras"]["base_url"],
+        api_key=MODEL_CONFIG["cerebras"]["api_key"]
+    )
+
+if MODEL_CONFIG["groq"]["api_key"]:
+    MODEL_CONFIG["groq"]["client"] = OpenAI(
+        base_url=MODEL_CONFIG["groq"]["base_url"],
+        api_key=MODEL_CONFIG["groq"]["api_key"]
+    )
+
+# Параметры токенов (если есть)
+TOKEN_LIMITS = {
+    "openrouter": {
+        "daily_limit": int(os.getenv("OPENROUTER_DAILY_LIMIT", "100000")),
+        "used_today": 0
+    },
+    "cerebras": {
+        "daily_limit": int(os.getenv("CEREBRAS_DAILY_LIMIT", "50000")),
+        "used_today": 0
+    },
+    "groq": {
+        "daily_limit": int(os.getenv("GROQ_DAILY_LIMIT", "50000")),
+        "used_today": 0
+    }
+}
 
 # Константы
 MAX_HISTORY_LENGTH = 10
@@ -84,6 +146,249 @@ def escape_html(text: str) -> str:
     )
 
 
+# Функция для проверки доступности модели
+async def check_model_availability(provider: str, model_name: str) -> bool:
+    """Проверяет доступность модели и наличие токенов"""
+    try:
+        config = MODEL_CONFIG.get(provider)
+        if not config or not config.get("client"):
+            logging.warning(f"Провайдер {provider} не настроен")
+            return False
+
+        # Проверка лимитов токенов
+        token_limit = TOKEN_LIMITS.get(provider, {})
+        if token_limit.get("daily_limit", 0) > 0 and token_limit.get("used_today", 0) >= token_limit["daily_limit"]:
+            logging.warning(f"Достигнут лимит токенов для провайдера {provider}")
+            return False
+
+        # Для OpenRouter можно проверить доступность модели через API
+        if provider == "openrouter":
+            try:
+                headers = {
+                    "Authorization": f"Bearer {config['api_key']}"
+                }
+                response = requests.get("https://openrouter.ai/api/v1/models", headers=headers)
+                if response.status_code == 200:
+                    models = response.json().get("data", [])
+                    available_models = [m["id"] for m in models]
+                    return model_name in available_models
+            except Exception as e:
+                logging.error(f"Ошибка при проверке доступности модели OpenRouter: {e}")
+
+        # Для других провайдеров просто проверяем, что API ключ существует
+        return True
+    except Exception as e:
+        logging.error(f"Ошибка при проверке доступности модели {model_name} у провайдера {provider}: {e}")
+        return False
+
+
+# Функция для обновления счетчика использованных токенов
+def update_token_usage(provider: str, tokens_used: int):
+    """Обновляет счетчик использованных токенов для провайдера"""
+    if provider in TOKEN_LIMITS:
+        TOKEN_LIMITS[provider]["used_today"] += tokens_used
+        logging.info(
+            f"Использовано токенов {provider}: {tokens_used}, всего сегодня: {TOKEN_LIMITS[provider]['used_today']}")
+
+
+# Функция для сброса счетчиков токенов (можно вызывать раз в день)
+def reset_token_usage():
+    """Сбрасывает ежедневные счетчики токенов"""
+    for provider in TOKEN_LIMITS:
+        TOKEN_LIMITS[provider]["used_today"] = 0
+    logging.info("Счетчики токенов сброшены")
+
+
+# Функция для генерации ответа с failover между провайдерами
+async def generate_answer_with_failover(
+        question: str,
+        context: str = "",
+        history: List[Dict[str, str]] = None,
+        patient_data: Dict[str, Any] = None,
+        user_id: int = None
+) -> Tuple[str, str, Dict[str, Any]]:
+    """
+    Генерирует ответ с использованием failover между провайдерами и моделями.
+    Возвращает кортеж: (ответ, провайдер, дополнительная информация)
+    """
+
+    # Формируем список всех моделей с учетом приоритета
+    all_models = []
+    for provider, config in MODEL_CONFIG.items():
+        for model in config["models"]:
+            all_models.append({
+                "provider": provider,
+                "name": model["name"],
+                "priority": model["priority"],
+                "client": config["client"]
+            })
+
+    # Сортируем по приоритету
+    all_models.sort(key=lambda x: x["priority"])
+
+    last_error = None
+    best_answer = ""
+    best_provider = ""
+    best_model = ""
+    best_metadata = {}
+
+    # Пробуем модели в порядке приоритета
+    for model_info in all_models:
+        provider = model_info["provider"]
+        model_name = model_info["name"]
+        client = model_info["client"]
+
+        # Проверяем доступность модели
+        if not await check_model_availability(provider, model_name):
+            logging.info(f"Модель {model_name} провайдера {provider} недоступна, пробуем следующую")
+            continue
+
+        try:
+            logging.info(f"Пробую модель {model_name} от провайдера {provider}")
+
+            # Формируем сообщения для модели
+            messages = [
+                {
+                    "role": "system",
+                    "content": """Ты — ИИ-ассистент врача. Твоя задача — помогать пользователям с медицинскими вопросами, 
+                    анализировать их анализы и предоставлять информацию о здоровье. Отвечай максимально точно и информативно, 
+                    используя предоставленный контекст. Учитывай историю диалога и данные пациента, если они доступны.
+                    ВАЖНО: Ты не ставишь диагноз и не заменяешь консультацию врача. Всегда рекомендуй консультацию 
+                    со специалистом для точной диагностики и лечения.
+                    Если в контексте есть точный ответ из авторитетных медицинских источников — используй его.
+                    Всегда указывай источник информации, если он известен.
+                    Отвечай на русском языке.
+                    Структурируй ответ с использованием эмодзи для лучшего восприятия."""
+                }
+            ]
+
+            if context:
+                messages.append({"role": "system", "content": f"Медицинская информация:\n{context}"})
+
+            # Добавляем информацию о пациенте
+            if patient_data:
+                patient_info = f"Информация о пациенте:\n"
+                if patient_data.get("name"):
+                    patient_info += f"Имя: {patient_data['name']}\n"
+                if patient_data.get("age"):
+                    patient_info += f"Возраст: {patient_data['age']}\n"
+                if patient_data.get("gender"):
+                    patient_info += f"Пол: {patient_data['gender']}\n"
+                messages.append({"role": "system", "content": patient_info})
+
+            # Добавляем историю диалога
+            if history:
+                recent_history = history[-MAX_CONTEXT_MESSAGES:] if len(history) > MAX_CONTEXT_MESSAGES else history
+                for msg in recent_history:
+                    messages.append(msg)
+
+            messages.append({"role": "user", "content": question})
+
+            # Добавляем заголовки для OpenRouter
+            extra_headers = {}
+            if provider == "openrouter":
+                extra_headers = {
+                    "HTTP-Referer": "https://github.com/vokforever/ai-doctor",
+                    "X-Title": "AI Doctor Bot"
+                }
+
+            # Выполняем запрос
+            completion = client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                **({"extra_headers": extra_headers} if extra_headers else {})
+            )
+
+            # Получаем ответ
+            current_answer = completion.choices[0].message.content
+
+            # Для некоторых моделей (например, Cerebras) может быть цепочка размышлений
+            thinking_process = ""
+            if provider == "cerebras" and hasattr(completion.choices[0], 'thinking'):
+                thinking_process = completion.choices[0].thinking
+
+            # Обновляем счетчик токенов (если есть информация)
+            if hasattr(completion, 'usage') and completion.usage:
+                tokens_used = completion.usage.total_tokens
+                update_token_usage(provider, tokens_used)
+
+            # Сохраняем информацию о модели
+            metadata = {
+                "provider": provider,
+                "model": model_name,
+                "thinking": thinking_process,
+                "usage": getattr(completion, 'usage', None)
+            }
+
+            # Возвращаем первый успешный ответ
+            return current_answer, provider, metadata
+
+        except Exception as e:
+            last_error = e
+            logging.warning(f"Ошибка при использовании модели {model_name} от провайдера {provider}: {e}")
+            continue
+
+    # Если все модели не сработали
+    logging.error(f"Все модели недоступны. Последняя ошибка: {last_error}")
+    error_message = "😔 К сожалению, произошла ошибка при генерации ответа. Все модели временно недоступны. Попробуйте повторить запрос позже."
+    return error_message, "", {}
+
+
+# Функция для сохранения успешных ответов с цепочкой размышлений
+async def save_successful_response(
+        user_id: int,
+        question: str,
+        answer: str,
+        provider: str,
+        metadata: Dict[str, Any],
+        conversation_history: List[Dict[str, str]] = None
+):
+    """Сохраняет успешный ответ и цепочку размышлений в базу данных"""
+    try:
+        # Формируем данные для сохранения
+        save_data = {
+            "user_id": user_id,
+            "question": question,
+            "answer": answer,
+            "provider": provider,
+            "model": metadata.get("model", ""),
+            "thinking": metadata.get("thinking", ""),
+            "usage": json.dumps(metadata.get("usage", {})),
+            "created_at": datetime.now().isoformat()
+        }
+
+        # Если есть история диалога, сохраняем ее
+        if conversation_history:
+            save_data["conversation_history"] = json.dumps(conversation_history)
+
+        # Сохраняем в базу данных
+        response = supabase.table("doc_successful_responses").insert(save_data).execute()
+
+        if response.data:
+            logging.info(f"Успешный ответ сохранен для пользователя {user_id}")
+            return True
+        else:
+            logging.error(f"Ошибка при сохранении успешного ответа для пользователя {user_id}")
+            return False
+
+    except Exception as e:
+        logging.error(f"Ошибка при сохранении успешного ответа: {e}")
+        return False
+
+
+# Функция для получения успешных ответов пользователя
+def get_user_successful_responses(user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+    """Получает успешные ответы пользователя"""
+    try:
+        response = supabase.table("doc_successful_responses").select("*").eq("user_id", user_id).order("created_at",
+                                                                                                       desc=True).limit(
+            limit).execute()
+        return response.data if response.data else []
+    except Exception as e:
+        logging.error(f"Ошибка при получении успешных ответов пользователя {user_id}: {e}")
+        return []
+
+
 # Агент для анализа анализов на основе horizon-beta
 class TestAnalysisAgent:
     def __init__(self):
@@ -92,13 +397,12 @@ class TestAnalysisAgent:
     async def analyze_test_results(self, text: str) -> List[Dict[str, Any]]:
         """Анализ текста анализов и извлечение структурированных данных"""
         try:
-            completion = openai_client.chat.completions.create(
+            completion = openrouter_client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {
                         "role": "system",
                         "content": """Ты — медицинский эксперт по анализам. Извлеки из текста все результаты анализов в структурированном формате.
-
                         Для каждого анализа укажи:
                         1. Название анализа (на русском)
                         2. Значение
@@ -106,7 +410,6 @@ class TestAnalysisAgent:
                         4. Единицы измерения
                         5. Дату анализа (если есть)
                         6. Отклонение от нормы (если есть)
-
                         Верни ответ в формате JSON массива объектов:
                         [
                             {
@@ -119,7 +422,6 @@ class TestAnalysisAgent:
                                 "notes": "Примечания"
                             }
                         ]
-
                         Если даты нет, укажи null. Если референсные значения не указаны, укажи null."""
                     },
                     {
@@ -128,9 +430,7 @@ class TestAnalysisAgent:
                     }
                 ]
             )
-
             response_text = completion.choices[0].message.content
-
             # Извлекаем JSON из ответа
             json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
             if json_match:
@@ -140,7 +440,6 @@ class TestAnalysisAgent:
                     return data
                 except json.JSONDecodeError:
                     pass
-
             return []
         except Exception as e:
             logging.error(f"Ошибка при анализе результатов анализов: {e}")
@@ -153,20 +452,17 @@ class TestAnalysisAgent:
             cache_key = f"summary_{user_id}_{'_'.join(test_names) if test_names else 'all'}"
             cached = supabase.table("doc_agent_cache").select("*").eq("user_id", user_id).eq("query",
                                                                                              cache_key).execute()
-
             if cached.data and datetime.now() < parse(cached.data[0]["expires_at"]):
                 return cached.data[0]["result"]["summary"]
 
             # Получаем анализы из базы
             query = supabase.table("doc_test_results").select("*").eq("user_id", user_id)
-
             if test_names:
                 # Фильтруем по названиям анализов
                 conditions = []
                 for name in test_names:
                     conditions.append(f"test_name.ilike.%{name}%")
                 query = query.or_(*conditions)
-
             results = query.order("test_date", desc=True).limit(50).execute()
 
             if not results.data:
@@ -180,18 +476,16 @@ class TestAnalysisAgent:
                     tests_text += f"  Отклонение от нормы: {test.get('notes', 'есть')}\n"
 
             # Анализируем анализы
-            completion = openai_client.chat.completions.create(
+            completion = openrouter_client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {
                         "role": "system",
                         "content": """Ты — медицинский ассистент. Проанализируй предоставленные анализы и дай краткую сводку:
-
                         1. Выдели основные показатели и их значения
                         2. Укажи, какие показатели выходят за пределы нормы
                         3. Дай общую оценку состояния пациента
                         4. Рекомендуй дополнительные обследования или консультации специалистов, если необходимо
-
                         Отвечай кратко и по делу, на русском языке."""
                     },
                     {
@@ -200,7 +494,6 @@ class TestAnalysisAgent:
                     }
                 ]
             )
-
             summary = completion.choices[0].message.content
 
             # Сохраняем в кэш
@@ -229,7 +522,6 @@ def extract_date(text: str) -> Optional[str]:
         r'(\d{4})-(\d{1,2})-(\d{1,2})',  # YYYY-MM-DD
         r'(\d{1,2})/(\d{1,2})/(\d{4})',  # DD/MM/YYYY
     ]
-
     for pattern in date_patterns:
         match = re.search(pattern, text)
         if match:
@@ -244,7 +536,6 @@ def extract_date(text: str) -> Optional[str]:
                     return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
             except:
                 continue
-
     return None
 
 
@@ -276,7 +567,6 @@ async def save_test_results(user_id: int, test_results: List[Dict[str, Any]], so
                 "notes": result.get("notes", ""),
                 "source": source
             }).execute()
-
         return True
     except Exception as e:
         logging.error(f"Ошибка при сохранении результатов анализов: {e}")
@@ -288,13 +578,11 @@ def get_patient_tests(user_id: int, test_names: List[str] = None, limit: int = 2
     """Получение анализов пациента"""
     try:
         query = supabase.table("doc_test_results").select("*").eq("user_id", user_id)
-
         if test_names:
             conditions = []
             for name in test_names:
                 conditions.append(f"test_name.ilike.%{name}%")
             query = query.or_(*conditions)
-
         return query.order("test_date", desc=True).limit(limit).execute().data
     except Exception as e:
         logging.error(f"Ошибка при получении анализов пациента: {e}")
@@ -399,7 +687,6 @@ def vector_search(query: str, threshold: float = 0.7) -> List[Tuple[str, str, fl
 
         # Получаем все записи с эмбеддингами
         response = supabase.table("doc_knowledge_base_vector").select("*").execute()
-
         results = []
         for item in response.data:
             if item.get("embedding"):
@@ -448,12 +735,10 @@ async def search_medical_sources(query: str) -> str:
             search_depth="advanced",
             max_results=3
         )
-
         results = []
         for result in response["results"]:
             if any(source in result["url"] for source in MEDICAL_SOURCES):
                 results.append(f"Источник: {result['url']}\n{result['content']}")
-
         return "\n\n".join(results) if results else ""
     except Exception as e:
         logging.error(f"Ошибка при поиске в медицинских источниках: {e}")
@@ -469,11 +754,9 @@ async def extract_text_from_pdf(file_path: str) -> str:
                     pdf_data = await response.read()
                     pdf_file = io.BytesIO(pdf_data)
                     pdf_reader = PyPDF2.PdfReader(pdf_file)
-
                     text = ""
                     for page in pdf_reader.pages:
                         text += page.extract_text() + "\n"
-
                     return text
         return ""
     except Exception as e:
@@ -484,7 +767,7 @@ async def extract_text_from_pdf(file_path: str) -> str:
 # Функция для извлечения данных пациента из текста
 async def extract_patient_data_from_text(text: str) -> Dict[str, Any]:
     try:
-        completion = openai_client.chat.completions.create(
+        completion = openrouter_client.chat.completions.create(
             model="z-ai/glm-4.5-air:free",
             messages=[
                 {
@@ -501,7 +784,6 @@ async def extract_patient_data_from_text(text: str) -> Dict[str, Any]:
             ]
         )
         response_text = completion.choices[0].message.content
-
         try:
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if json_match:
@@ -533,7 +815,7 @@ async def extract_patient_data_from_text(text: str) -> Dict[str, Any]:
 # Функция для анализа изображения
 async def analyze_image(image_url: str, query: str = "Что показано на этом медицинском изображении?") -> str:
     try:
-        completion = openai_client.chat.completions.create(
+        completion = openrouter_client.chat.completions.create(
             extra_headers={
                 "HTTP-Referer": "https://github.com/vokforever/ai-doctor",
                 "X-Title": "AI Doctor Bot"
@@ -588,7 +870,6 @@ def create_patient_profile(user_id: int, name: str, age: int, gender: str) -> bo
             "gender": gender,
             "created_at": datetime.now().isoformat()
         }).execute()
-
         return len(response.data) > 0
     except Exception as e:
         logging.error(f"Ошибка при создании профиля пациента: {e}")
@@ -615,7 +896,6 @@ def save_medical_record(user_id: int, record_type: str, content: str, source: st
             "source": source,
             "created_at": datetime.now().isoformat()
         }).execute()
-
         return len(response.data) > 0
     except Exception as e:
         logging.error(f"Ошибка при сохранении медицинской записи: {e}")
@@ -626,10 +906,8 @@ def save_medical_record(user_id: int, record_type: str, content: str, source: st
 def get_medical_records(user_id: int, record_type: str = None) -> List[Dict[str, Any]]:
     try:
         query = supabase.table("doc_medical_records").select("*").eq("user_id", user_id)
-
         if record_type:
             query = query.eq("record_type", record_type)
-
         response = query.order("created_at", desc=True).execute()
         return response.data if response.data else []
     except Exception as e:
@@ -646,7 +924,6 @@ def save_to_knowledge_base(question: str, answer: str, source: str = ""):
             "source": source,
             "created_at": datetime.now().isoformat()
         }).execute()
-
         save_to_vector_knowledge_base(question, answer, source)
     except Exception as e:
         logging.error(f"Ошибка при сохранении в базу знаний: {e}")
@@ -665,158 +942,11 @@ def save_user_feedback(user_id: int, question: str, helped: bool):
         logging.error(f"Ошибка при сохранении обратной связи: {e}")
 
 
-# Функция для генерации ответа с MOE подходом
+# Функция для генерации ответа с MOE подходом (старая версия, оставлена для совместимости)
 async def generate_answer(question: str, context: str = "", history: List[Dict[str, str]] = None,
                           patient_data: Dict[str, Any] = None, user_id: int = None) -> str:
-    models_to_try = [
-        "openrouter/horizon-beta",
-        "moonshotai/kimi-k2:free",
-        "z-ai/glm-4.5-air:free",
-        "openai/gpt-oss-20b:free",
-        "mistralai/mistral-large-2407",
-        "mistralai/mistral-7b-instruct"
-    ]
-
-    last_error = None
-    best_answer = ""
-    best_model = ""
-
-    # MOE: пробуем несколько моделей и выбираем лучший ответ
-    for model in models_to_try[:3]:
-        try:
-            messages = [
-                {
-                    "role": "system",
-                    "content": """Ты — ИИ-ассистент врача. Твоя задача — помогать пользователям с медицинскими вопросами, 
-                    анализировать их анализы и предоставлять информацию о здоровье. Отвечай максимально точно и информативно, 
-                    используя предоставленный контекст. Учитывай историю диалога и данные пациента, если они доступны.
-
-                    ВАЖНО: Ты не ставишь диагноз и не заменяешь консультацию врача. Всегда рекомендуй консультацию 
-                    со специалистом для точной диагностики и лечения.
-
-                    Если в контексте есть точный ответ из авторитетных медицинских источников — используй его.
-                    Всегда указывай источник информации, если он известен.
-                    Отвечай на русском языке.
-                    Структурируй ответ с использованием эмодзи для лучшего восприятия."""
-                }
-            ]
-
-            if context:
-                messages.append({"role": "system", "content": f"Медицинская информация:\n{context}"})
-
-            # Добавляем информацию о пациенте
-            if patient_data:
-                patient_info = f"Информация о пациенте:\n"
-                if patient_data.get("name"):
-                    patient_info += f"Имя: {patient_data['name']}\n"
-                if patient_data.get("age"):
-                    patient_info += f"Возраст: {patient_data['age']}\n"
-                if patient_data.get("gender"):
-                    patient_info += f"Пол: {patient_data['gender']}\n"
-
-                messages.append({"role": "system", "content": patient_info})
-
-            # Добавляем историю диалога
-            if history:
-                recent_history = history[-MAX_CONTEXT_MESSAGES:] if len(history) > MAX_CONTEXT_MESSAGES else history
-                for msg in recent_history:
-                    messages.append(msg)
-
-            messages.append({"role": "user", "content": question})
-
-            # Добавляем заголовки для OpenRouter
-            extra_headers = {
-                "HTTP-Referer": "https://github.com/vokforever/ai-doctor",
-                "X-Title": "AI Doctor Bot"
-            }
-
-            completion = openai_client.chat.completions.create(
-                model=model,
-                messages=messages,
-                extra_headers=extra_headers
-            )
-
-            current_answer = completion.choices[0].message.content
-
-            # Для MOE: оцениваем качество ответа
-            if not best_answer or len(current_answer) > len(best_answer):
-                best_answer = current_answer
-                best_model = model
-
-        except Exception as e:
-            last_error = e
-            logging.warning(f"Ошибка при использовании модели {model}: {e}")
-            continue
-
-    # Если получили хотя бы один ответ от MOE, возвращаем лучший
-    if best_answer:
-        logging.info(f"Использована модель: {best_model}")
-        return best_answer
-
-    # Если все модели MOE не сработали, пробуем оставшиеся модели
-    for model in models_to_try[3:]:
-        try:
-            messages = [
-                {
-                    "role": "system",
-                    "content": """Ты — ИИ-ассистент врача. Твоя задача — помогать пользователям с медицинскими вопросами, 
-                    анализировать их анализы и предоставлять информацию о здоровье. Отвечай максимально точно и информативно, 
-                    используя предоставленный контекст. Учитывай историю диалога и данные пациента, если они доступны.
-
-                    ВАЖНО: Ты не ставишь диагноз и не заменяешь консультацию врача. Всегда рекомендуй консультацию 
-                    со специалистом для точной диагностики и лечения.
-
-                    Если в контексте есть точный ответ из авторитетных медицинских источников — используй его.
-                    Всегда указывай источник информации, если он известен.
-                    Отвечай на русском языке.
-                    Структурируй ответ с использованием эмодзи для лучшего восприятия."""
-                }
-            ]
-
-            if context:
-                messages.append({"role": "system", "content": f"Медицинская информация:\n{context}"})
-
-            # Добавляем информацию о пациенте
-            if patient_data:
-                patient_info = f"Информация о пациенте:\n"
-                if patient_data.get("name"):
-                    patient_info += f"Имя: {patient_data['name']}\n"
-                if patient_data.get("age"):
-                    patient_info += f"Возраст: {patient_data['age']}\n"
-                if patient_data.get("gender"):
-                    patient_info += f"Пол: {patient_data['gender']}\n"
-
-                messages.append({"role": "system", "content": patient_info})
-
-            # Добавляем историю диалога
-            if history:
-                recent_history = history[-MAX_CONTEXT_MESSAGES:] if len(history) > MAX_CONTEXT_MESSAGES else history
-                for msg in recent_history:
-                    messages.append(msg)
-
-            messages.append({"role": "user", "content": question})
-
-            # Добавляем заголовки для OpenRouter
-            extra_headers = {
-                "HTTP-Referer": "https://github.com/vokforever/ai-doctor",
-                "X-Title": "AI Doctor Bot"
-            }
-
-            completion = openai_client.chat.completions.create(
-                model=model,
-                messages=messages,
-                extra_headers=extra_headers
-            )
-            return completion.choices[0].message.content
-
-        except Exception as e:
-            last_error = e
-            logging.warning(f"Ошибка при использовании модели {model}: {e}")
-            continue
-
-    # Если все модели не сработали
-    logging.error(f"Все модели недоступны. Последняя ошибка: {last_error}")
-    return "😔 К сожалению, произошла ошибка при генерации ответа. Все модели временно недоступны. Попробуйте повторить запрос позже."
+    answer, _, _ = await generate_answer_with_failover(question, context, history, patient_data, user_id)
+    return answer
 
 
 # Функция для поиска в интернете
@@ -835,7 +965,6 @@ async def clear_conversation_state(state: FSMContext, chat_id: int):
         scheduler.remove_job(f"reminder_{chat_id}")
     except:
         pass
-
     await state.clear()
 
 
@@ -843,9 +972,7 @@ async def clear_conversation_state(state: FSMContext, chat_id: int):
 @dp.message(Command("start"))
 async def start_command(message: types.Message, state: FSMContext):
     await clear_conversation_state(state, message.chat.id)
-
     profile = get_patient_profile(message.from_user.id)
-
     if profile:
         await message.answer(
             f"👋 Здравствуйте, {profile['name']}! Я ваш ИИ-ассистент врача.\n\n"
@@ -855,7 +982,8 @@ async def start_command(message: types.Message, state: FSMContext):
             f"/profile - ваш профиль\n"
             f"/stats - моя статистика помощи\n"
             f"/history - история обращений\n"
-            f"/clear - очистить историю",
+            f"/clear - очистить историю\n"
+            f"/models - статус моделей",
             reply_markup=get_main_keyboard()
         )
     else:
@@ -867,16 +995,43 @@ async def start_command(message: types.Message, state: FSMContext):
             "/profile - создать профиль\n"
             "/stats - моя статистика помощи\n"
             "/history - история обращений\n"
-            "/clear - очистить историю",
+            "/clear - очистить историю\n"
+            "/models - статус моделей",
             reply_markup=get_main_keyboard()
         )
+
+
+# Обработчик команды /models для проверки статуса моделей
+@dp.message(Command("models"))
+async def models_command(message: types.Message):
+    status_text = "🤖 <b>Статус моделей:</b>\n\n"
+
+    for provider, config in MODEL_CONFIG.items():
+        status_text += f"<b>{provider.upper()}:</b>\n"
+
+        for model in config["models"]:
+            model_name = model["name"]
+            is_available = await check_model_availability(provider, model_name)
+            status = "✅ Доступна" if is_available else "❌ Недоступна"
+            status_text += f"  • {model_name}: {status}\n"
+
+        # Добавляем информацию об использовании токенов
+        token_info = TOKEN_LIMITS.get(provider, {})
+        if token_info.get("daily_limit", 0) > 0:
+            used = token_info.get("used_today", 0)
+            limit = token_info["daily_limit"]
+            percentage = (used / limit) * 100 if limit > 0 else 0
+            status_text += f"  📊 Токены: {used}/{limit} ({percentage:.1f}%)\n"
+
+        status_text += "\n"
+
+    await message.answer(status_text, parse_mode="HTML")
 
 
 # Обработчик команды /profile
 @dp.message(Command("profile"))
 async def profile_command(message: types.Message, state: FSMContext):
     profile = get_patient_profile(message.from_user.id)
-
     if profile:
         await message.answer(
             f"👤 <b>Ваш профиль:</b>\n\n"
@@ -911,11 +1066,15 @@ async def stats_command(message: types.Message):
         total = len(response.data)
         helped = sum(1 for item in response.data if item["helped"])
 
+        # Получаем статистику по успешным ответам
+        successful_responses = get_user_successful_responses(message.from_user.id)
+
         await message.answer(
             f"📊 Ваша статистика:\n"
             f"Всего вопросов: {total}\n"
             f"Помогло ответов: {helped}\n"
-            f"Успешность: {helped / total * 100:.1f}%" if total > 0 else "📊 У вас пока нет статистики"
+            f"Успешность: {helped / total * 100:.1f}%" if total > 0 else "📊 У вас пока нет статистики",
+            reply_markup=get_main_keyboard()
         )
     except Exception as e:
         logging.error(f"Ошибка при получении статистики: {e}")
@@ -928,13 +1087,11 @@ async def history_command(message: types.Message):
     try:
         response = supabase.table("doc_user_feedback").select("*").eq("user_id", message.from_user.id).order(
             "created_at", desc=True).limit(5).execute()
-
         if response.data:
             history_text = "📝 Последние вопросы:\n\n"
             for item in response.data:
                 status = "✅" if item["helped"] else "❌"
                 history_text += f"{status} {item['question'][:50]}...\n"
-
             await message.answer(history_text)
         else:
             await message.answer("📝 У вас пока нет истории обращений")
@@ -948,7 +1105,6 @@ async def history_command(message: types.Message):
 async def clear_command(message: types.Message, state: FSMContext):
     try:
         await clear_conversation_state(state, message.chat.id)
-
         supabase.table("doc_user_feedback").delete().eq("user_id", message.from_user.id).execute()
         await message.answer("🗑️ Ваша история очищена")
     except Exception as e:
@@ -961,7 +1117,6 @@ async def clear_command(message: types.Message, state: FSMContext):
 async def handle_profile_creation(message: types.Message, state: FSMContext):
     try:
         text = message.text
-
         name = ""
         age = 0
         gender = ""
@@ -1010,17 +1165,14 @@ async def handle_profile_creation(message: types.Message, state: FSMContext):
 @dp.message(F.document)
 async def handle_document(message: types.Message, state: FSMContext):
     profile = get_patient_profile(message.from_user.id)
-
     if message.document.mime_type == "application/pdf":
         file_id = message.document.file_id
         file_info = await bot.get_file(file_id)
         file_path = file_info.file_path
         file_url = f"https://api.telegram.org/file/bot{os.getenv('TELEGRAM_BOT_TOKEN')}/{file_path}"
-
         processing_msg = await message.answer("📊 Обрабатываю PDF файл...")
 
         pdf_text = await extract_text_from_pdf(file_url)
-
         if pdf_text:
             # Сохраняем в медицинские записи
             save_medical_record(
@@ -1032,7 +1184,6 @@ async def handle_document(message: types.Message, state: FSMContext):
 
             # Анализируем результаты анализов с помощью агента
             test_results = await test_agent.analyze_test_results(pdf_text)
-
             if test_results:
                 # Сохраняем структурированные результаты
                 await save_test_results(
@@ -1046,7 +1197,6 @@ async def handle_document(message: types.Message, state: FSMContext):
                 # Если профиля нет, пытаемся извлечь данные пациента
                 if not profile:
                     patient_data = await extract_patient_data_from_text(pdf_text)
-
                     if patient_data and (
                             patient_data.get("name") or patient_data.get("age") or patient_data.get("gender")):
                         extracted_info = "📝 Я обнаружил(а) в вашем анализе следующие данные:\n\n"
@@ -1056,7 +1206,6 @@ async def handle_document(message: types.Message, state: FSMContext):
                             extracted_info += f"🎂 Возраст: {patient_data['age']}\n"
                         if patient_data.get("gender"):
                             extracted_info += f"⚧️ Пол: {patient_data['gender']}\n"
-
                         extracted_info += "\nСоздать профиль с этими данными?"
 
                         await message.answer(
@@ -1072,7 +1221,6 @@ async def handle_document(message: types.Message, state: FSMContext):
                                 )
                             ).as_markup()
                         )
-
                         await state.set_state(DoctorStates.confirming_profile)
                         await state.update_data(
                             extracted_patient_data=patient_data,
@@ -1090,7 +1238,6 @@ async def handle_document(message: types.Message, state: FSMContext):
                         )
                     ).as_markup()
                 )
-
                 await state.set_state(DoctorStates.waiting_for_clarification)
                 await state.update_data(pdf_text=pdf_text)
             else:
@@ -1106,7 +1253,6 @@ async def handle_document(message: types.Message, state: FSMContext):
 @dp.message(F.photo)
 async def handle_photo(message: types.Message, state: FSMContext):
     profile = get_patient_profile(message.from_user.id)
-
     if not profile:
         await message.answer(
             "😔 Для загрузки изображений необходимо создать профиль пациента.\n"
@@ -1120,7 +1266,6 @@ async def handle_photo(message: types.Message, state: FSMContext):
     file_url = f"https://api.telegram.org/file/bot{os.getenv('TELEGRAM_BOT_TOKEN')}/{file_path}"
 
     processing_msg = await message.answer("🔍 Анализирую изображение...")
-
     analysis_result = await analyze_image(file_url, "Что показано на этом медицинском изображении? Опиши подробно.")
 
     await processing_msg.edit_text("✅ Изображение успешно проанализировано.")
@@ -1148,7 +1293,6 @@ async def handle_message(message: types.Message, state: FSMContext):
 
     data = await state.get_data()
     history = data.get("history", [])
-
     history.append({"role": "user", "content": question})
 
     if len(history) > MAX_HISTORY_LENGTH:
@@ -1157,13 +1301,11 @@ async def handle_message(message: types.Message, state: FSMContext):
             "🔄 История диалога стала слишком длинной, я удалил самые старые сообщения для оптимизации.")
 
     profile = get_patient_profile(user_id)
-
     processing_msg = await message.answer("🔍 Ищу информацию по вашему вопросу...")
 
     # Проверяем, есть ли в вопросе запрос на анализ анализов
     analysis_keywords = ['анализ', 'анализы', 'результат', 'показатель', 'кровь', 'моча', 'биохимия', 'общий анализ']
     test_context = ""
-
     if any(keyword in question.lower() for keyword in analysis_keywords):
         # Получаем сводку по анализам от агента
         test_summary = await test_agent.get_test_summary(user_id)
@@ -1172,29 +1314,29 @@ async def handle_message(message: types.Message, state: FSMContext):
 
     # 1. Сначала ищем в авторитетных медицинских источниках
     medical_context = await search_medical_sources(question)
-
     if medical_context:
         await processing_msg.edit_text("📚 Найдено в медицинских источниках. Генерирую ответ...")
-        answer = await generate_answer(question, medical_context + test_context, history, profile, user_id)
+        answer, provider, metadata = await generate_answer_with_failover(question, medical_context + test_context,
+                                                                         history, profile, user_id)
         source = "авторитетных медицинских источников"
     else:
         # 2. Если не нашли в медицинских источниках, ищем в своей базе знаний
         await processing_msg.edit_text("🗂️ Ищу в накопленной базе знаний...")
         kb_context = search_knowledge_base(question)
-
         if kb_context:
             await processing_msg.edit_text("💡 Найдено в базе знаний. Генерирую ответ...")
-            answer = await generate_answer(question, kb_context + test_context, history, profile, user_id)
+            answer, provider, metadata = await generate_answer_with_failover(question, kb_context + test_context,
+                                                                             history, profile, user_id)
             source = "накопленной базы знаний"
         else:
             # 3. Если нигде не нашли, ищем в интернете
             await processing_msg.edit_text("🌐 Ищу дополнительную информацию в интернете...")
             web_context = await search_web(f"{question} медицина здоровье")
-            answer = await generate_answer(question, web_context + test_context, history, profile, user_id)
+            answer, provider, metadata = await generate_answer_with_failover(question, web_context + test_context,
+                                                                             history, profile, user_id)
             source = "интернета"
 
     await processing_msg.delete()
-
     history.append({"role": "assistant", "content": answer})
 
     await message.answer(f"{escape_html(answer)}\n\n📖 <b>Источник:</b> {escape_html(source)}", parse_mode="HTML")
@@ -1205,6 +1347,8 @@ async def handle_message(message: types.Message, state: FSMContext):
         question=question,
         answer=answer,
         source=source,
+        provider=provider,
+        metadata=metadata,
         attempts=0,
         user_id=user_id,
         history=history
@@ -1226,25 +1370,28 @@ async def handle_feedback_callback(callback: types.CallbackQuery, state: FSMCont
     question = data["question"]
     answer = data["answer"]
     source = data["source"]
+    provider = data.get("provider", "")
+    metadata = data.get("metadata", {})
     attempts = data.get("attempts", 0)
     user_id = data.get("user_id", callback.from_user.id)
+    history = data.get("history", [])
     chat_id = callback.message.chat.id
 
     if callback.data == "feedback_yes":
+        # Сохраняем успешный ответ с цепочкой размышлений
+        await save_successful_response(user_id, question, answer, provider, metadata, history)
+
         if source != "авторитетных медицинских источников":
             save_to_knowledge_base(question, answer, source)
 
         save_user_feedback(user_id, question, True)
-
         await callback.message.edit_text(
             "✅ Отлично! Я рад(а), что смог(ла) помочь.\n"
             "Если у вас появятся еще вопросы — обращайтесь! 😊\n\n"
             "⚠️ Помните, что для точной диагностики и лечения необходима консультация врача.",
             reply_markup=get_main_keyboard()
         )
-
         await clear_conversation_state(state, chat_id)
-
     elif callback.data == "feedback_no":
         if attempts < 2:
             await callback.message.edit_text(
@@ -1254,7 +1401,6 @@ async def handle_feedback_callback(callback: types.CallbackQuery, state: FSMCont
             await state.update_data(attempts=attempts + 1)
         else:
             save_user_feedback(user_id, question, False)
-
             await callback.message.edit_text(
                 "😔 К сожалению, я не смог(ла) найти достаточно информации по вашему вопросу.\n\n"
                 "Рекомендую:\n"
@@ -1263,34 +1409,28 @@ async def handle_feedback_callback(callback: types.CallbackQuery, state: FSMCont
                 "• 📊 Загрузить анализы для более точного анализа",
                 reply_markup=get_main_keyboard()
             )
-
             await clear_conversation_state(state, chat_id)
-
     elif callback.data == "search_more":
         await callback.message.edit_text("🔍 Ищу дополнительную информацию...")
-
-        history = data.get("history", [])
         profile = get_patient_profile(user_id)
-
         web_context = await search_web(f"{question} медицина диагноз лечение")
-        new_answer = await generate_answer(question, web_context, history, profile, user_id)
-
+        new_answer, new_provider, new_metadata = await generate_answer_with_failover(question, web_context, history,
+                                                                                     profile, user_id)
         history.append({"role": "assistant", "content": new_answer})
         await state.update_data(history=history)
-
         await callback.message.edit_text(
             f"{escape_html(new_answer)}\n\n📖 <b>Источник:</b> дополнительный поиск в интернете",
             parse_mode="HTML"
         )
-
         await bot.send_message(
             chat_id,
             "❓ Помог ли вам этот новый ответ?",
             reply_markup=get_feedback_keyboard()
         )
-
         await state.update_data(
             answer=new_answer,
+            provider=new_provider,
+            metadata=new_metadata,
             source="интернета (дополнительный поиск)",
             attempts=attempts + 1
         )
@@ -1305,49 +1445,44 @@ async def handle_clarification_callback(callback: types.CallbackQuery, state: FS
             "🔄 Пожалуйста, уточните ваш вопрос или опишите симптомы более подробно."
         )
         await state.set_state(DoctorStates.waiting_for_clarification)
-
     elif callback.data == "upload_tests":
         await callback.message.edit_text(
             "📊 Пожалуйста, загрузите PDF файл с вашими анализами или отправьте фото медицинского документа."
         )
         await state.set_state(DoctorStates.waiting_for_file)
-
     elif callback.data == "try_again":
         data = await state.get_data()
         question = data["question"]
         history = data.get("history", [])
-
         profile = get_patient_profile(callback.from_user.id)
 
         await callback.message.edit_text("🔄 Пробую найти другой ответ...")
-
         web_context = await search_web(f"{question} медицина здоровье лечение")
-        new_answer = await generate_answer(question, web_context, history, profile, callback.from_user.id)
-
+        new_answer, new_provider, new_metadata = await generate_answer_with_failover(question, web_context, history,
+                                                                                     profile, callback.from_user.id)
         history.append({"role": "assistant", "content": new_answer})
         await state.update_data(history=history)
-
         await callback.message.edit_text(
             f"{escape_html(new_answer)}\n\n📖 <b>Источник:</b> дополнительный поиск в интернете",
             parse_mode="HTML",
             reply_markup=get_feedback_keyboard()
         )
-
-        await state.update_data(answer=new_answer, source="интернета")
+        await state.update_data(
+            answer=new_answer,
+            provider=new_provider,
+            metadata=new_metadata,
+            source="интернета"
+        )
         await state.set_state(DoctorStates.waiting_for_feedback)
-
     elif callback.data == "analyze_pdf":
         data = await state.get_data()
         pdf_text = data.get("pdf_text", "")
-
         if pdf_text:
             await callback.message.edit_text("📊 Анализирую результаты анализов...")
-
             profile = get_patient_profile(callback.from_user.id)
 
             # Используем агента для анализа
             analysis_result = await test_agent.get_test_summary(callback.from_user.id)
-
             if analysis_result:
                 save_medical_record(
                     user_id=callback.from_user.id,
@@ -1355,14 +1490,12 @@ async def handle_clarification_callback(callback: types.CallbackQuery, state: FS
                     content=analysis_result,
                     source="Анализ PDF файла"
                 )
-
                 await callback.message.edit_text(
                     f"📊 <b>Результат анализа:</b>\n\n{analysis_result}\n\n"
                     f"⚠️ Помните, что это автоматический анализ, и он не заменяет консультацию специалиста.",
                     parse_mode="HTML",
                     reply_markup=get_main_keyboard()
                 )
-
                 await state.clear()
             else:
                 await callback.message.edit_text(
@@ -1373,11 +1506,9 @@ async def handle_clarification_callback(callback: types.CallbackQuery, state: FS
                 "😔 Не удалось найти данные для анализа. Пожалуйста, загрузите PDF файл с анализами снова."
             )
             await state.set_state(DoctorStates.waiting_for_file)
-
     elif callback.data == "create_extracted_profile":
         data = await state.get_data()
         patient_data = data.get("extracted_patient_data", {})
-
         if patient_data and (patient_data.get("name") or patient_data.get("age") or patient_data.get("gender")):
             missing_data = []
             if not patient_data.get("name"):
@@ -1434,7 +1565,6 @@ async def handle_clarification_callback(callback: types.CallbackQuery, state: FS
         else:
             await callback.message.edit_text(
                 "😔 Не удалось извлечь данные пациента. Пожалуйста, создайте профиль вручную с помощью команды /profile.")
-
     elif callback.data == "manual_profile":
         await callback.message.edit_text(
             "📝 Для создания профиля пациента, пожалуйста, предоставьте следующую информацию:\n\n"
@@ -1457,7 +1587,6 @@ async def handle_main_menu_callback(callback: types.CallbackQuery, state: FSMCon
 
     if callback.data == "my_tests":
         tests = get_patient_tests(user_id)
-
         if tests:
             tests_text = "📊 <b>Ваши анализы:</b>\n\n"
             for test in tests[:10]:
@@ -1466,7 +1595,6 @@ async def handle_main_menu_callback(callback: types.CallbackQuery, state: FSMCon
                 if test.get('notes'):
                     tests_text += f"   💬 {test['notes']}\n"
                 tests_text += "\n"
-
             await callback.message.edit_text(
                 tests_text,
                 parse_mode="HTML",
@@ -1478,16 +1606,13 @@ async def handle_main_menu_callback(callback: types.CallbackQuery, state: FSMCon
                 "Вы можете загрузить PDF файл с анализами или отправить фото медицинского документа.",
                 reply_markup=get_main_keyboard()
             )
-
     elif callback.data == "my_history":
         records = get_medical_records(user_id)
-
         if records:
             history_text = "📝 <b>Ваша медицинская история:</b>\n\n"
             for record in records[:5]:
                 record_type = record.get("record_type", "запись")
                 history_text += f"📅 {record['created_at'][:10]} ({record_type}): {record['content'][:100]}...\n\n"
-
             await callback.message.edit_text(
                 history_text,
                 parse_mode="HTML",
@@ -1499,10 +1624,8 @@ async def handle_main_menu_callback(callback: types.CallbackQuery, state: FSMCon
                 "Она будет формироваться по мере ваших обращений и загрузки анализов.",
                 reply_markup=get_main_keyboard()
             )
-
     elif callback.data == "create_profile":
         profile = get_patient_profile(user_id)
-
         if profile:
             await callback.message.edit_text(
                 f"👤 <b>Ваш профиль:</b>\n\n"
@@ -1534,10 +1657,8 @@ async def handle_main_menu_callback(callback: types.CallbackQuery, state: FSMCon
 async def handle_clarification(message: types.Message, state: FSMContext):
     data = await state.get_data()
     history = data.get("history", [])
-
     history.append({"role": "user", "content": message.text})
     await state.update_data(history=history)
-
     await state.clear()
     await handle_message(message, state)
 
@@ -1565,10 +1686,19 @@ async def send_reminder(chat_id: int):
         logging.error(f"Ошибка при отправке напоминания: {e}")
 
 
-# Планировщик для отложенных напоминаний
+# Планировщик для отложенных напоминаний и сброса токенов
 @dp.startup()
 async def on_startup():
     scheduler.start()
+
+    # Добавляем задачу для ежедневного сброса счетчиков токенов в полночь
+    scheduler.add_job(
+        reset_token_usage,
+        "cron",
+        hour=0,
+        minute=0,
+        id="reset_token_usage"
+    )
 
 
 @dp.shutdown()

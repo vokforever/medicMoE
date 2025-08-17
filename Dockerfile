@@ -17,4 +17,8 @@ RUN mkdir -p logs && chmod +x main.py
 EXPOSE 8080
 
 # Команда запуска
+<<<<<<< HEAD
 CMD ["python", "main.py"]
+=======
+CMD ["python", "main.py"]
+>>>>>>> 1f4e21d (Initial commit)
