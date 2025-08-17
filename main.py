@@ -341,7 +341,7 @@ async def generate_answer_with_failover(
 
 # Функция для сохранения успешных ответов с цепочкой размышлений
 async def save_successful_response(
-        user_id: int,
+        user_id: str,
         question: str,
         answer: str,
         provider: str,
@@ -382,7 +382,7 @@ async def save_successful_response(
 
 
 # Функция для получения успешных ответов пользователя
-def get_user_successful_responses(user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+def get_user_successful_responses(user_id: str, limit: int = 10) -> List[Dict[str, Any]]:
     """Получает успешные ответы пользователя"""
     try:
         response = supabase.table("doc_successful_responses").select("*").eq("user_id", user_id).order("created_at",
@@ -456,7 +456,7 @@ class TestAnalysisAgent:
             logging.error(f"Ошибка при анализе результатов анализов: {e}")
             return []
 
-    async def get_test_summary(self, user_id: int, test_names: List[str] = None) -> str:
+    async def get_test_summary(self, user_id: str, test_names: List[str] = None) -> str:
         """Получение сводки по анализам пациента"""
         try:
             # Проверяем кэш
@@ -551,7 +551,7 @@ def extract_date(text: str) -> Optional[str]:
 
 
 # Функция для сохранения результатов анализов
-async def save_test_results(user_id: int, test_results: List[Dict[str, Any]], source: str = ""):
+async def save_test_results(user_id: str, test_results: List[Dict[str, Any]], source: str = ""):
     """Сохранение результатов анализов в базу данных"""
     try:
         for result in test_results:
@@ -585,7 +585,7 @@ async def save_test_results(user_id: int, test_results: List[Dict[str, Any]], so
 
 
 # Функция для получения анализов пациента
-def get_patient_tests(user_id: int, test_names: List[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+def get_patient_tests(user_id: str, test_names: List[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
     """Получение анализов пациента"""
     try:
         query = supabase.table("doc_test_results").select("*").eq("user_id", user_id)
@@ -921,7 +921,7 @@ def search_knowledge_base(query: str) -> str:
 
 
 # Функция для создания профиля пациента
-def create_patient_profile(user_id: int, name: str, age: int, gender: str) -> bool:
+def create_patient_profile(user_id: str, name: str, age: int, gender: str) -> bool:
     try:
         response = supabase.table("doc_patient_profiles").insert({
             "user_id": user_id,
@@ -937,7 +937,7 @@ def create_patient_profile(user_id: int, name: str, age: int, gender: str) -> bo
 
 
 # Функция для получения профиля пациента
-def get_patient_profile(user_id: int) -> Optional[Dict[str, Any]]:
+def get_patient_profile(user_id: str) -> Optional[Dict[str, Any]]:
     try:
         response = supabase.table("doc_patient_profiles").select("*").eq("user_id", user_id).execute()
         return response.data[0] if response.data else None
@@ -947,7 +947,7 @@ def get_patient_profile(user_id: int) -> Optional[Dict[str, Any]]:
 
 
 # Функция для сохранения медицинских записей
-def save_medical_record(user_id: int, record_type: str, content: str, source: str = "") -> bool:
+def save_medical_record(user_id: str, record_type: str, content: str, source: str = "") -> bool:
     try:
         response = supabase.table("doc_medical_records").insert({
             "user_id": user_id,
@@ -963,7 +963,7 @@ def save_medical_record(user_id: int, record_type: str, content: str, source: st
 
 
 # Функция для получения медицинских записей
-def get_medical_records(user_id: int, record_type: str = None) -> List[Dict[str, Any]]:
+def get_medical_records(user_id: str, record_type: str = None) -> List[Dict[str, Any]]:
     try:
         query = supabase.table("doc_medical_records").select("*").eq("user_id", user_id)
         if record_type:
@@ -990,7 +990,7 @@ def save_to_knowledge_base(question: str, answer: str, source: str = ""):
 
 
 # Функция для сохранения обратной связи
-def save_user_feedback(user_id: int, question: str, helped: bool):
+def save_user_feedback(user_id: str, question: str, helped: bool):
     try:
         supabase.table("doc_user_feedback").insert({
             "user_id": user_id,
@@ -1032,7 +1032,7 @@ async def clear_conversation_state(state: FSMContext, chat_id: int):
 @dp.message(Command("start"))
 async def start_command(message: types.Message, state: FSMContext):
     await clear_conversation_state(state, message.chat.id)
-    profile = get_patient_profile(message.from_user.id)
+    profile = get_patient_profile(str(message.from_user.id))
     if profile:
         await message.answer(
             f"👋 Здравствуйте, {profile['name']}! Я ваш ИИ-ассистент врача.\n\n"
@@ -1091,7 +1091,7 @@ async def models_command(message: types.Message):
 # Обработчик команды /profile
 @dp.message(Command("profile"))
 async def profile_command(message: types.Message, state: FSMContext):
-    profile = get_patient_profile(message.from_user.id)
+    profile = get_patient_profile(str(message.from_user.id))
     if profile:
         await message.answer(
             f"👤 <b>Ваш профиль:</b>\n\n"
@@ -1122,12 +1122,12 @@ async def profile_command(message: types.Message, state: FSMContext):
 @dp.message(Command("stats"))
 async def stats_command(message: types.Message):
     try:
-        response = supabase.table("doc_user_feedback").select("*").eq("user_id", message.from_user.id).execute()
+        response = supabase.table("doc_user_feedback").select("*").eq("user_id", str(message.from_user.id)).execute()
         total = len(response.data)
         helped = sum(1 for item in response.data if item["helped"])
 
         # Получаем статистику по успешным ответам
-        successful_responses = get_user_successful_responses(message.from_user.id)
+        successful_responses = get_user_successful_responses(str(message.from_user.id))
 
         await message.answer(
             f"📊 Ваша статистика:\n"
@@ -1145,7 +1145,7 @@ async def stats_command(message: types.Message):
 @dp.message(Command("history"))
 async def history_command(message: types.Message):
     try:
-        response = supabase.table("doc_user_feedback").select("*").eq("user_id", message.from_user.id).order(
+        response = supabase.table("doc_user_feedback").select("*").eq("user_id", str(message.from_user.id)).order(
             "created_at", desc=True).limit(5).execute()
         if response.data:
             history_text = "📝 Последние вопросы:\n\n"
@@ -1165,7 +1165,7 @@ async def history_command(message: types.Message):
 async def clear_command(message: types.Message, state: FSMContext):
     try:
         await clear_conversation_state(state, message.chat.id)
-        supabase.table("doc_user_feedback").delete().eq("user_id", message.from_user.id).execute()
+        supabase.table("doc_user_feedback").delete().eq("user_id", str(message.from_user.id)).execute()
         await message.answer("🗑️ Ваша история очищена")
     except Exception as e:
         logging.error(f"Ошибка при очистке истории: {e}")
@@ -1194,7 +1194,7 @@ async def handle_profile_creation(message: types.Message, state: FSMContext):
                 gender = line.split(':', 1)[1].strip()
 
         if name and age > 0 and gender in ['м', 'ж']:
-            if create_patient_profile(message.from_user.id, name, age, gender):
+            if create_patient_profile(str(message.from_user.id), name, age, gender):
                 await message.answer(
                     f"✅ Профиль успешно создан!\n\n"
                     f"👤 <b>Ваш профиль:</b>\n"
@@ -1224,7 +1224,7 @@ async def handle_profile_creation(message: types.Message, state: FSMContext):
 # Обработчик загрузки файлов
 @dp.message(F.document)
 async def handle_document(message: types.Message, state: FSMContext):
-    profile = get_patient_profile(message.from_user.id)
+    profile = get_patient_profile(str(message.from_user.id))
     if message.document.mime_type == "application/pdf":
         file_id = message.document.file_id
         file_info = await bot.get_file(file_id)
@@ -1236,7 +1236,7 @@ async def handle_document(message: types.Message, state: FSMContext):
         if pdf_text:
             # Сохраняем в медицинские записи
             save_medical_record(
-                user_id=message.from_user.id,
+                user_id=str(message.from_user.id),
                 record_type="analysis",
                 content=pdf_text[:2000],
                 source=f"PDF файл: {message.document.file_name}"
@@ -1247,7 +1247,7 @@ async def handle_document(message: types.Message, state: FSMContext):
             if test_results:
                 # Сохраняем структурированные результаты
                 await save_test_results(
-                    user_id=message.from_user.id,
+                    user_id=str(message.from_user.id),
                     test_results=test_results,
                     source=f"PDF файл: {message.document.file_name}"
                 )
@@ -1334,7 +1334,7 @@ async def handle_photo(message: types.Message, state: FSMContext):
     patient_data = await extract_patient_data_from_text(analysis_result)
     
     # Проверяем, есть ли профиль у пользователя
-    profile = get_patient_profile(message.from_user.id)
+    profile = get_patient_profile(str(message.from_user.id))
     
     if not profile:
         # Если профиля нет, предлагаем создать его на основе извлеченных данных
@@ -1371,7 +1371,7 @@ async def handle_photo(message: types.Message, state: FSMContext):
             )
         else:
             # Если не удалось извлечь данные, создаем анонимный профиль
-            create_patient_profile(message.from_user.id, "аноним", None, None)
+            create_patient_profile(str(message.from_user.id), "аноним", None, None)
             await message.answer(
                 "✅ Создан анонимный профиль.\n\n"
                 f"📊 <b>Результат анализа:</b>\n\n{analysis_result}\n\n"
@@ -1403,7 +1403,7 @@ async def handle_message(message: types.Message, state: FSMContext):
         await message.answer(
             "🔄 История диалога стала слишком длинной, я удалил самые старые сообщения для оптимизации.")
 
-    profile = get_patient_profile(user_id)
+    profile = get_patient_profile(str(user_id))
     processing_msg = await message.answer("🔍 Ищу информацию по вашему вопросу...")
 
     # Проверяем, есть ли в вопросе запрос на анализ анализов
@@ -1411,7 +1411,7 @@ async def handle_message(message: types.Message, state: FSMContext):
     test_context = ""
     if any(keyword in question.lower() for keyword in analysis_keywords):
         # Получаем сводку по анализам от агента
-        test_summary = await test_agent.get_test_summary(user_id)
+        test_summary = await test_agent.get_test_summary(str(user_id))
         if test_summary:
             test_context = f"\n\n📊 {test_summary}"
 
@@ -1420,7 +1420,7 @@ async def handle_message(message: types.Message, state: FSMContext):
     if medical_context:
         await processing_msg.edit_text("📚 Найдено в медицинских источниках. Генерирую ответ...")
         answer, provider, metadata = await generate_answer_with_failover(question, medical_context + test_context,
-                                                                         history, profile, user_id)
+                                                                         history, profile, str(user_id))
         source = "авторитетных медицинских источников"
     else:
         # 2. Если не нашли в медицинских источниках, ищем в своей базе знаний
@@ -1429,14 +1429,14 @@ async def handle_message(message: types.Message, state: FSMContext):
         if kb_context:
             await processing_msg.edit_text("💡 Найдено в базе знаний. Генерирую ответ...")
             answer, provider, metadata = await generate_answer_with_failover(question, kb_context + test_context,
-                                                                             history, profile, user_id)
+                                                                             history, profile, str(user_id))
             source = "накопленной базы знаний"
         else:
             # 3. Если нигде не нашли, ищем в интернете
             await processing_msg.edit_text("🌐 Ищу дополнительную информацию в интернете...")
             web_context = await search_web(f"{question} медицина здоровье")
             answer, provider, metadata = await generate_answer_with_failover(question, web_context + test_context,
-                                                                             history, profile, user_id)
+                                                                             history, profile, str(user_id))
             source = "интернета"
 
     await processing_msg.delete()
@@ -1453,7 +1453,7 @@ async def handle_message(message: types.Message, state: FSMContext):
         provider=provider,
         metadata=metadata,
         attempts=0,
-        user_id=user_id,
+        user_id=str(user_id),
         history=history
     )
 
@@ -1476,7 +1476,7 @@ async def handle_feedback_callback(callback: types.CallbackQuery, state: FSMCont
     provider = data.get("provider", "")
     metadata = data.get("metadata", {})
     attempts = data.get("attempts", 0)
-    user_id = data.get("user_id", callback.from_user.id)
+    user_id = data.get("user_id", str(callback.from_user.id))
     history = data.get("history", [])
     chat_id = callback.message.chat.id
 
@@ -1515,10 +1515,10 @@ async def handle_feedback_callback(callback: types.CallbackQuery, state: FSMCont
             await clear_conversation_state(state, chat_id)
     elif callback.data == "search_more":
         await callback.message.edit_text("🔍 Ищу дополнительную информацию...")
-        profile = get_patient_profile(user_id)
+        profile = get_patient_profile(str(user_id))
         web_context = await search_web(f"{question} медицина диагноз лечение")
         new_answer, new_provider, new_metadata = await generate_answer_with_failover(question, web_context, history,
-                                                                                     profile, user_id)
+                                                                                     profile, str(user_id))
         history.append({"role": "assistant", "content": new_answer})
         await state.update_data(history=history)
         await callback.message.edit_text(
@@ -1553,7 +1553,7 @@ async def handle_profile_creation_callback(callback: types.CallbackQuery, state:
         gender = patient_data.get("gender")
         
         # Создаем профиль
-        if create_patient_profile(callback.from_user.id, name, age, gender):
+        if create_patient_profile(str(callback.from_user.id), name, age, gender):
             await callback.message.edit_text(
                 f"✅ Профиль успешно создан!\n\n"
                 f"👤 <b>Ваш профиль:</b>\n"
@@ -1568,7 +1568,7 @@ async def handle_profile_creation_callback(callback: types.CallbackQuery, state:
             await callback.message.edit_text("😔 Не удалось создать профиль. Пожалуйста, попробуйте еще раз.")
     else:
         # Создаем анонимный профиль
-        create_patient_profile(callback.from_user.id, "аноним", None, None)
+        create_patient_profile(str(callback.from_user.id), "аноним", None, None)
         await callback.message.edit_text(
             "✅ Создан анонимный профиль.\n\n"
             f"📊 <b>Результат анализа:</b>\n\n{analysis_result}\n\n"
@@ -1593,7 +1593,7 @@ async def handle_pdf_profile_creation_callback(callback: types.CallbackQuery, st
         gender = patient_data.get("gender")
         
         # Создаем профиль
-        if create_patient_profile(callback.from_user.id, name, age, gender):
+        if create_patient_profile(str(callback.from_user.id), name, age, gender):
             await callback.message.edit_text(
                 f"✅ Профиль успешно создан!\n\n"
                 f"👤 <b>Ваш профиль:</b>\n"
@@ -1615,7 +1615,7 @@ async def handle_pdf_profile_creation_callback(callback: types.CallbackQuery, st
             await callback.message.edit_text("😔 Не удалось создать профиль. Пожалуйста, попробуйте еще раз.")
     else:
         # Создаем анонимный профиль
-        create_patient_profile(callback.from_user.id, "аноним", None, None)
+        create_patient_profile(str(callback.from_user.id), "аноним", None, None)
         await callback.message.edit_text(
             "✅ Создан анонимный профиль.\n\n"
             "🔍 Хотите, чтобы я проанализировал(а) ваши анализы?",
@@ -1649,12 +1649,12 @@ async def handle_clarification_callback(callback: types.CallbackQuery, state: FS
         data = await state.get_data()
         question = data["question"]
         history = data.get("history", [])
-        profile = get_patient_profile(callback.from_user.id)
+        profile = get_patient_profile(str(callback.from_user.id))
 
         await callback.message.edit_text("🔄 Пробую найти другой ответ...")
         web_context = await search_web(f"{question} медицина здоровье лечение")
         new_answer, new_provider, new_metadata = await generate_answer_with_failover(question, web_context, history,
-                                                                                     profile, callback.from_user.id)
+                                                                                     profile, str(callback.from_user.id))
         history.append({"role": "assistant", "content": new_answer})
         await state.update_data(history=history)
         await callback.message.edit_text(
@@ -1674,13 +1674,13 @@ async def handle_clarification_callback(callback: types.CallbackQuery, state: FS
         pdf_text = data.get("pdf_text", "")
         if pdf_text:
             await callback.message.edit_text("📊 Анализирую результаты анализов...")
-            profile = get_patient_profile(callback.from_user.id)
+            profile = get_patient_profile(str(callback.from_user.id))
 
             # Используем агента для анализа
-            analysis_result = await test_agent.get_test_summary(callback.from_user.id)
+            analysis_result = await test_agent.get_test_summary(str(callback.from_user.id))
             if analysis_result:
                 save_medical_record(
-                    user_id=callback.from_user.id,
+                    user_id=str(callback.from_user.id),
                     record_type="analysis_result",
                     content=analysis_result,
                     source="Анализ PDF файла"
@@ -1725,7 +1725,7 @@ async def handle_clarification_callback(callback: types.CallbackQuery, state: FS
                 await state.set_state(DoctorStates.waiting_for_patient_id)
                 await state.update_data(extracted_patient_data=patient_data)
             else:
-                if create_patient_profile(callback.from_user.id, patient_data['name'], patient_data['age'],
+                if create_patient_profile(str(callback.from_user.id), patient_data['name'], patient_data['age'],
                                           patient_data['gender']):
                     await callback.message.edit_text(
                         f"✅ Профиль успешно создан!\n\n"
@@ -1778,7 +1778,7 @@ async def handle_clarification_callback(callback: types.CallbackQuery, state: FS
 # Обработчик кнопок главного меню
 @dp.callback_query(F.data.in_(["my_tests", "my_history", "create_profile"]))
 async def handle_main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
+    user_id = str(callback.from_user.id)
 
     if callback.data == "my_tests":
         tests = get_patient_tests(user_id)
