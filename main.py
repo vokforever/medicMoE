@@ -61,6 +61,8 @@ MEDICAL_SOURCES = [
 ]
 
 # Конфигурация моделей для failover
+# Vision модели (qwen, gemini) используются только для анализа изображений
+# Text модели (deepseek, gpt, glm, kimi) используются для текстовых задач
 MODEL_CONFIG = {
     "openrouter": {
         "api_key": os.getenv("OPENROUTER_API_KEY"),
@@ -420,7 +422,8 @@ class ClarificationAgent:
             # Используем общий механизм выбора моделей по приоритету
             response, provider, metadata = await call_model_with_failover(
                 messages=messages,
-                system_prompt="Ты - медицинский ассистент, который помогает собрать информацию для ответа на медицинский вопрос."
+                system_prompt="Ты - медицинский ассистент, который помогает собрать информацию для ответа на медицинский вопрос.",
+                model_type="text"
             )
             
             response = response.strip()
@@ -451,7 +454,8 @@ async def generate_answer_with_failover(
         history: List[Dict[str, str]] = None,
         patient_data: Dict[str, Any] = None,
         user_id: int = None,
-        system_prompt: str = None
+        system_prompt: str = None,
+        model_type: str = "text"
 ) -> Tuple[str, str, Dict[str, Any]]:
     """
     Генерирует ответ с использованием failover между провайдерами и моделями.
@@ -507,7 +511,8 @@ async def generate_answer_with_failover(
     # Используем универсальную функцию с failover
     return await call_model_with_failover(
         messages=messages,
-        system_prompt=system_prompt
+        system_prompt=system_prompt,
+        model_type=model_type
     )
 
 
@@ -614,7 +619,8 @@ class TestAnalysisAgent:
             # Используем общий механизм выбора моделей по приоритету
             response_text, _, _ = await call_model_with_failover(
                 messages=messages,
-                system_prompt="Ты — медицинский эксперт по анализам. Извлеки из текста все результаты анализов в структурированном формате."
+                system_prompt="Ты — медицинский эксперт по анализам. Извлеки из текста все результаты анализов в структурированном формате.",
+                model_type="text"
             )
             
             # Извлекаем JSON из ответа
@@ -681,7 +687,8 @@ class TestAnalysisAgent:
             # Используем общий механизм выбора моделей по приоритету
             summary, _, _ = await call_model_with_failover(
                 messages=messages,
-                system_prompt="Ты — медицинский ассистент. Проанализируй предоставленные анализы и дай краткую сводку."
+                system_prompt="Ты — медицинский ассистент. Проанализируй предоставленные анализы и дай краткую сводку.",
+                model_type="text"
             )
 
             # Сохраняем в кэш
@@ -984,7 +991,8 @@ async def extract_patient_data_from_text(text: str) -> Dict[str, Any]:
         
         response_text, _, _ = await call_model_with_failover(
             messages=messages,
-            system_prompt="Ты — помощник, который извлекает данные пациента из медицинских документов."
+            system_prompt="Ты — помощник, который извлекает данные пациента из медицинских документов.",
+            model_type="text"
         )
         try:
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
@@ -2000,7 +2008,7 @@ async def handle_message(message: types.Message, state: FSMContext):
         # Если спрашивают о конкретных результатах и у нас есть данные - отвечаем сразу
         await processing_msg.edit_text(f"📊 Анализирую ваши результаты анализов... ({mode_indicator})")
         answer, provider, metadata = await generate_answer_with_failover(
-            question, test_context, history, profile, str(user_id), system_prompt
+            question, test_context, history, profile, str(user_id), system_prompt, model_type="text"
         )
         source = "ваших результатов анализов"
     else:
@@ -2009,7 +2017,7 @@ async def handle_message(message: types.Message, state: FSMContext):
         if medical_context:
             await processing_msg.edit_text(f"📚 Найдено в медицинских источниках. Генерирую ответ... ({mode_indicator})")
             answer, provider, metadata = await generate_answer_with_failover(
-                question, medical_context + test_context, history, profile, str(user_id), system_prompt
+                question, medical_context + test_context, history, profile, str(user_id), system_prompt, model_type="text"
             )
             source = "авторитетных медицинских источников"
         else:
@@ -2019,7 +2027,7 @@ async def handle_message(message: types.Message, state: FSMContext):
             if kb_context:
                 await processing_msg.edit_text(f"💡 Найдено в базе знаний. Генерирую ответ... ({mode_indicator})")
                 answer, provider, metadata = await generate_answer_with_failover(
-                    question, kb_context + test_context, history, profile, str(user_id), system_prompt
+                    question, kb_context + test_context, history, profile, str(user_id), system_prompt, model_type="text"
                 )
                 source = "накопленной базы знаний"
             else:
@@ -2027,7 +2035,7 @@ async def handle_message(message: types.Message, state: FSMContext):
                 await processing_msg.edit_text(f"🌐 Ищу дополнительную информацию в интернете... ({mode_indicator})")
                 web_context = await search_web(f"{question} медицина здоровье")
                 answer, provider, metadata = await generate_answer_with_failover(
-                    question, web_context + test_context, history, profile, str(user_id), system_prompt
+                    question, web_context + test_context, history, profile, str(user_id), system_prompt, model_type="text"
                 )
                 source = "интернета"
     
