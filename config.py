@@ -42,13 +42,20 @@ MEDICAL_SOURCES = [
 ]
 
 # Конфигурация моделей для failover
-# Vision модели (qwen, gemini) используются только для анализа изображений
-# Text модели (deepseek, gpt, glm, kimi) используются для текстовых задач
+# Vision модели (qwen, gemini, llama-4-scout/maverick) используются только для анализа изображений
+# Text модели (deepseek, gpt, glm, kimi, llama-3.x) используются для текстовых задач
 # 
 # ВАЖНО: Разные провайдеры используют разные названия параметров:
 # - OpenAI/OpenRouter: max_tokens
 # - Cerebras: max_tokens (не max_completion_tokens)
 # - Groq: max_tokens
+# 
+# ВАЖНО для Groq: НЕ используйте суффикс ":free" - это только для OpenRouter!
+# Правильные названия Groq моделей:
+# - meta-llama/llama-4-scout-17b-16e-instruct (vision)
+# - meta-llama/llama-4-maverick-17b-128e-instruct (vision)
+# - llama-3.1-8b-instant (text)
+# - llama-3.3-70b-versatile (text)
 MODEL_CONFIG = {
     "openrouter": {
         "api_key": openrouter_api_key,
@@ -68,11 +75,11 @@ MODEL_CONFIG = {
         "api_key": os.getenv("GROQ_API_KEY"),
         "base_url": "https://api.groq.com/openai/v1",
         "models": [
-            {"name": "llama-3.2-90b-vision-preview", "priority": 1, "type": "vision"},
-            {"name": "llama-3.2-90b-instruct", "priority": 2, "type": "text"},
-            {"name": "llama-3.2-8b-instruct", "priority": 3, "type": "text"},
-            {"name": "llama-3.2-1b-instruct", "priority": 4, "type": "text"},
-            {"name": "mixtral-8x7b-32768", "priority": 5, "type": "text"}
+            {"name": "meta-llama/llama-4-scout-17b-16e-instruct", "priority": 1, "type": "vision"},
+            {"name": "meta-llama/llama-4-maverick-17b-128e-instruct", "priority": 2, "type": "vision"},
+            {"name": "llama-3.1-8b-instant", "priority": 3, "type": "text"},
+            {"name": "llama-3.3-70b-versatile", "priority": 4, "type": "text"},
+            {"name": "meta-llama/llama-guard-4-12b", "priority": 5, "type": "text"}
         ],
         "client": None  # Будет инициализирован позже
     },
