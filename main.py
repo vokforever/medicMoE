@@ -167,6 +167,7 @@ class DoctorStates(StatesGroup):
     viewing_history = State()
     confirming_profile = State()
     updating_profile = State()
+    waiting_for_test_data = State()  # Ожидание дополнения данных анализов
 
 
 # Функция для экранирования HTML
@@ -821,6 +822,10 @@ class TestAnalysisAgent:
 # Инициализация агента
 test_agent = TestAnalysisAgent()
 
+# Импорт и инициализация агента для структурированных данных
+from structured_tests_agent import StructuredTestAgent
+structured_test_agent = StructuredTestAgent(supabase)
+
 
 # Функция для извлечения даты из текста
 def extract_date(text: str) -> Optional[str]:
@@ -953,6 +958,10 @@ def get_main_keyboard():
         callback_data="my_tests"
     ))
     builder.add(types.InlineKeyboardButton(
+        text="📋 Структурированные анализы",
+        callback_data="structured_tests"
+    ))
+    builder.add(types.InlineKeyboardButton(
         text="📝 Мой анамнез",
         callback_data="my_history"
     ))
@@ -960,7 +969,7 @@ def get_main_keyboard():
         text="🆔 Создать профиль пациента",
         callback_data="create_profile"
     ))
-    builder.adjust(1)
+    builder.adjust(2, 2)
     
     logging.debug("Главная клавиатура создана")
     return builder.as_markup()
@@ -2123,12 +2132,46 @@ async def handle_document(message: types.Message, state: FSMContext):
                 await message.answer("✅ Создан анонимный профиль для обработки PDF.")
             
             # Теперь сохраняем в медицинские записи (профиль уже существует)
-            await save_medical_record(
+            save_success = await save_medical_record(
                 user_id=generate_user_uuid(message.from_user.id),
                 record_type="analysis",
                 content=pdf_text[:2000],
                 source=f"PDF file: {message.document.file_name}"
             )
+            
+            if save_success:
+                # Автоматически извлекаем и структурируем данные
+                result = await structured_test_agent.extraction_agent.extract_and_structure_tests(generate_user_uuid(message.from_user.id))
+                
+                if result["success"]:
+                    await processing_msg.edit_text(
+                        f"✅ PDF файл успешно обработан. Извлечено {result['tests_count']} анализов."
+                    )
+                    
+                    # Если есть недостающие данные, предлагаем добавить
+                    if result["missing_data"]:
+                        missing_message = "⚠️ **Обнаружены неполные данные:**\n\n"
+                        for item in result["missing_data"][:3]:
+                            missing_message += f"- {item['test_name']}: {', '.join(item['missing_fields'])}\n"
+                        
+                        missing_message += "\nХотите дополнить эту информацию?"
+                        
+                        await message.answer(
+                            missing_message,
+                            reply_markup=InlineKeyboardBuilder().add(
+                                types.InlineKeyboardButton(
+                                    text="✅ Дополнить данные",
+                                    callback_data="complete_test_data"
+                                )
+                            ).as_markup()
+                        )
+                        
+                        await state.set_state(DoctorStates.waiting_for_test_data)
+                        await state.update_data(missing_tests=result["missing_data"])
+                else:
+                    await processing_msg.edit_text("✅ PDF файл успешно обработан.")
+            else:
+                await processing_msg.edit_text("😔 Не удалось сохранить данные PDF файла.")
 
             # Анализируем результаты анализов с помощью агента
             test_results = await test_agent.analyze_test_results(pdf_text)
@@ -2394,12 +2437,42 @@ async def handle_photo(message: types.Message, state: FSMContext):
             )
         
         # В любом случае сохраняем в медицинские записи
-        await save_medical_record(
+        save_success = await save_medical_record(
             user_id=generate_user_uuid(message.from_user.id),
             record_type="image_analysis",
             content=analysis_result,
             source="Изображение из Telegram"
         )
+        
+        if save_success:
+            # Автоматически извлекаем и структурируем данные
+            result = await structured_test_agent.extraction_agent.extract_and_structure_tests(generate_user_uuid(message.from_user.id))
+            
+            if result["success"]:
+                await message.answer(
+                    f"✅ Данные анализов успешно обработаны. Извлечено {result['tests_count']} анализов."
+                )
+                
+                # Если есть недостающие данные, предлагаем добавить
+                if result["missing_data"]:
+                    missing_message = "⚠️ **Обнаружены неполные данные:**\n\n"
+                    for item in result["missing_data"][:3]:
+                        missing_message += f"- {item['test_name']}: {', '.join(item['missing_fields'])}\n"
+                    
+                    missing_message += "\nХотите дополнить эту информацию?"
+                    
+                    await message.answer(
+                        missing_message,
+                        reply_markup=InlineKeyboardBuilder().add(
+                            types.InlineKeyboardButton(
+                                text="✅ Дополнить данные",
+                                callback_data="complete_test_data"
+                            )
+                        ).as_markup()
+                    )
+                    
+                    await state.set_state(DoctorStates.waiting_for_test_data)
+                    await state.update_data(missing_tests=result["missing_data"])
 
 
 # Основной обработчик сообщений
@@ -2452,6 +2525,39 @@ async def handle_message(message: types.Message, state: FSMContext):
     
     # Если информации достаточно, продолжаем стандартную обработку
     
+    # Проверяем, не запрос ли это на получение таблицы анализов
+    if any(keyword in question.lower() for keyword in ["мои анализы", "таблица анализов", "все анализы", "покажи анализы"]):
+        logging.info("Пользователь запрашивает таблицу анализов")
+        await processing_msg.edit_text("📊 Формирую таблицу с вашими анализами...")
+        table = await structured_test_agent.get_test_results_table(generate_user_uuid(user_id))
+        
+        await processing_msg.delete()
+        await message.answer(table, parse_mode="Markdown")
+        
+        # Проверяем, есть ли недостающие данные
+        missing_data = await structured_test_agent.extraction_agent._identify_missing_data(generate_user_uuid(user_id))
+        if missing_data:
+            missing_message = "⚠️ **Обнаружены неполные данные:**\n\n"
+            for item in missing_data[:3]:  # Показываем первые 3
+                missing_message += f"- {item['test_name']}: {', '.join(item['missing_fields'])}\n"
+            
+            missing_message += "\nХотите дополнить эту информацию?"
+            
+            await message.answer(
+                missing_message,
+                reply_markup=InlineKeyboardBuilder().add(
+                    types.InlineKeyboardButton(
+                        text="✅ Дополнить данные",
+                        callback_data="complete_test_data"
+                    )
+                ).as_markup()
+            )
+            
+            await state.set_state(DoctorStates.waiting_for_test_data)
+            await state.update_data(missing_tests=missing_data)
+        
+        return
+    
     # Интеллектуальный анализ типа запроса
     query_analysis = await intelligent_analyzer.analyze_query_type(question, generate_user_uuid(user_id))
     
@@ -2465,6 +2571,58 @@ async def handle_message(message: types.Message, state: FSMContext):
             "Пожалуйста, сначала загрузите изображение или PDF файл с результатами анализов, "
             "а затем я смогу ответить на ваш вопрос о конкретных показателях."
         )
+        return
+    
+    # Проверяем, не запрос ли на конкретный анализ
+    test_result = await structured_test_agent.get_specific_test_result(
+        generate_user_uuid(user_id), question
+    )
+    
+    if test_result["found"]:
+        logging.info(f"Найден анализ: {test_result['test'].get('test_name')}")
+        await processing_msg.edit_text("📊 Нахожу информацию об анализе...")
+        
+        test_data = test_result["test"]
+        
+        # Формируем ответ
+        response = f"📊 **Результаты анализа:**\n\n"
+        response += f"**Название:** {test_data.get('test_name', '')}\n"
+        response += f"**Результат:** {test_data.get('result', '')}\n"
+        
+        if test_data.get('reference_values'):
+            response += f"**Референсные значения:** {test_data.get('reference_values', '')}\n"
+        
+        if test_data.get('units'):
+            response += f"**Единицы измерения:** {test_data.get('units', '')}\n"
+        
+        if test_data.get('test_date'):
+            test_date = datetime.strptime(test_data['test_date'], "%Y-%m-%d").strftime("%d.%m.%Y")
+            response += f"**Дата сдачи:** {test_date}\n"
+        
+        if test_data.get('test_system'):
+            response += f"**Тест-система:** {test_data.get('test_system', '')}\n"
+        
+        if test_data.get('equipment'):
+            response += f"**Оборудование:** {test_data.get('equipment', '')}\n"
+        
+        if test_data.get('notes'):
+            response += f"**Примечания:** {test_data.get('notes', '')}\n"
+        
+        await processing_msg.delete()
+        await message.answer(response, parse_mode="Markdown")
+        
+        # Проверяем, есть ли недостающие данные
+        if not test_data.get('test_date'):
+            await message.answer(
+                "⚠️ Для этого анализа не указана дата сдачи. Хотите добавить?",
+                reply_markup=InlineKeyboardBuilder().add(
+                    types.InlineKeyboardButton(
+                        text="✅ Добавить дату",
+                        callback_data=f"add_test_date_{test_data['id']}"
+                    )
+                ).as_markup()
+            )
+        
         return
     
     processing_msg = await message.answer("🔍 Анализирую ваш вопрос...")
@@ -3254,6 +3412,145 @@ class IntelligentQueryAnalyzer:
 
 # Создаем экземпляр интеллектуального анализатора
 intelligent_analyzer = IntelligentQueryAnalyzer()
+
+
+# Обработчики для дополнения данных анализов
+@dp.callback_query(F.data == "complete_test_data")
+async def handle_complete_test_data(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик кнопки дополнения данных анализов"""
+    try:
+        data = await state.get_data()
+        missing_tests = data.get("missing_tests", [])
+        
+        if missing_tests:
+            # Формируем сообщение с запросом данных для первого теста
+            test = missing_tests[0]
+            message = await structured_test_agent.request_missing_data(
+                generate_user_uuid(callback.from_user.id),
+                test["test_id"]
+            )
+            
+            await callback.message.edit_text(message)
+            await state.update_data(current_test_id=test["test_id"])
+        else:
+            await callback.message.edit_text("✅ Все данные уже заполнены!")
+            
+    except Exception as e:
+        logging.error(f"Ошибка при обработке дополнения данных: {e}")
+        await callback.message.edit_text("😔 Произошла ошибка. Попробуйте еще раз.")
+
+
+@dp.message(DoctorStates.waiting_for_test_data)
+async def handle_test_data_update(message: types.Message, state: FSMContext):
+    """Обработчик сообщений с дополнением данных анализов"""
+    try:
+        data = await state.get_data()
+        current_test_id = data.get("current_test_id")
+        user_id = generate_user_uuid(message.from_user.id)
+        
+        if not current_test_id:
+            await message.answer("😔 Не удалось определить, какой анализ обновлять. Попробуйте еще раз.")
+            await state.clear()
+            return
+        
+        # Парсим данные из сообщения
+        lines = message.text.split('\n')
+        update_data = {}
+        
+        for line in lines:
+            line = line.strip().lower()
+            if line.startswith('дата:'):
+                date_str = line.split(':', 1)[1].strip()
+                update_data['test_date'] = date_str
+            elif line.startswith('норма:'):
+                ref_values = line.split(':', 1)[1].strip()
+                update_data['reference_values'] = ref_values
+        
+        if update_data:
+            # Обновляем данные
+            success = await structured_test_agent.update_test_data(user_id, current_test_id, update_data)
+            
+            if success:
+                await message.answer("✅ Данные успешно обновлены!")
+                
+                # Проверяем, есть ли еще тесты с недостающими данными
+                missing_data = await structured_test_agent.extraction_agent._identify_missing_data(user_id)
+                if missing_data:
+                    # Запрашиваем данные для следующего теста
+                    next_test = missing_data[0]
+                    next_message = await structured_test_agent.request_missing_data(user_id, next_test["test_id"])
+                    await message.answer(next_message)
+                    await state.update_data(current_test_id=next_test["test_id"])
+                else:
+                    await message.answer("✅ Все данные заполнены!")
+                    await state.clear()
+            else:
+                await message.answer("😔 Не удалось обновить данные. Пожалуйста, попробуйте еще раз.")
+        else:
+            await message.answer("😔 Не удалось распознать данные. Пожалуйста, проверьте формат.")
+            
+    except Exception as e:
+        logging.error(f"Ошибка при обновлении данных теста: {e}")
+        await message.answer("😔 Произошла ошибка. Пожалуйста, попробуйте еще раз.")
+
+
+@dp.callback_query(F.data.startswith("add_test_date_"))
+async def handle_add_test_date(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик добавления даты для конкретного анализа"""
+    try:
+        test_id = int(callback.data.split("_")[-1])
+        user_id = generate_user_uuid(callback.from_user.id)
+        
+        message = await structured_test_agent.request_missing_data(user_id, test_id)
+        
+        await callback.message.edit_text(message)
+        await state.set_state(DoctorStates.waiting_for_test_data)
+        await state.update_data(current_test_id=test_id)
+        
+    except Exception as e:
+        logging.error(f"Ошибка при добавлении даты: {e}")
+        await callback.message.edit_text("😔 Произошла ошибка. Попробуйте еще раз.")
+
+
+@dp.callback_query(F.data == "structured_tests")
+async def handle_structured_tests(callback: types.CallbackQuery):
+    """Обработчик кнопки структурированных анализов"""
+    try:
+        user_id = generate_user_uuid(callback.from_user.id)
+        
+        # Показываем таблицу анализов
+        table = await structured_test_agent.get_test_results_table(user_id)
+        
+        await callback.message.edit_text(table, parse_mode="Markdown")
+        
+        # Проверяем, есть ли недостающие данные
+        missing_data = await structured_test_agent.extraction_agent._identify_missing_data(user_id)
+        if missing_data:
+            missing_message = "⚠️ **Обнаружены неполные данные:**\n\n"
+            for item in missing_data[:3]:  # Показываем первые 3
+                missing_message += f"- {item['test_name']}: {', '.join(item['missing_fields'])}\n"
+            
+            missing_message += "\nХотите дополнить эту информацию?"
+            
+            await callback.message.answer(
+                missing_message,
+                reply_markup=InlineKeyboardBuilder().add(
+                    types.InlineKeyboardButton(
+                        text="✅ Дополнить данные",
+                        callback_data="complete_test_data"
+                    )
+                ).as_markup()
+            )
+            
+            # Устанавливаем состояние для дополнения данных
+            from aiogram.fsm.context import FSMContext
+            state = FSMContext(callback.message.chat.id, callback.from_user.id)
+            await state.set_state(DoctorStates.waiting_for_test_data)
+            await state.update_data(missing_tests=missing_data)
+        
+    except Exception as e:
+        logging.error(f"Ошибка при обработке структурированных анализов: {e}")
+        await callback.message.edit_text("😔 Произошла ошибка при получении анализов. Попробуйте еще раз.")
 
 
 # Функция для очистки существующих дубликатов медицинских записей
