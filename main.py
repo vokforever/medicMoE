@@ -10,7 +10,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Импорты из наших модулей
 from config import bot_token, supabase
-from models import call_model_with_failover
+from models import call_model_with_failover, reset_provider_blocks
 from agents import ClarificationAgent, TestAnalysisAgent, IntelligentQueryAnalyzer
 from database import (
     generate_user_uuid, create_patient_profile, get_patient_profile, save_medical_record, get_user_successful_responses
@@ -664,12 +664,21 @@ async def start_command(message: types.Message, state: FSMContext):
 @dp.message(Command("models"))
 async def models_command(message: types.Message):
     from config import MODEL_CONFIG, TOKEN_LIMITS
-    from models import check_model_availability
+    from models import check_model_availability, is_provider_blocked
     
     status_text = "🤖 <b>Статус моделей:</b>\n\n"
+    
+    # Проверяем заблокированные провайдеры
+    blocked_providers = [p for p in MODEL_CONFIG.keys() if is_provider_blocked(p)]
+    if blocked_providers:
+        status_text += f"🚫 <b>Заблокированные провайдеры:</b> {', '.join(blocked_providers)}\n\n"
 
     for provider, config in MODEL_CONFIG.items():
-        status_text += f"<b>{provider.upper()}:</b>\n"
+        # Проверяем статус провайдера
+        if is_provider_blocked(provider):
+            status_text += f"<b>{provider.upper()}:</b> 🚫 <i>Заблокирован</i>\n"
+        else:
+            status_text += f"<b>{provider.upper()}:</b>\n"
 
         for model in config["models"]:
             model_name = model["name"]
@@ -857,6 +866,29 @@ async def reprocess_tests_command(message: types.Message):
     except Exception as e:
         logging.error(f"Ошибка при переобработке анализов: {e}")
         await message.answer("😔 Не удалось переобработать анализы. Попробуйте позже.")
+
+# Обработчик команды /reset_providers
+@dp.message(Command("reset_providers"))
+async def reset_providers_command(message: types.Message):
+    """Сбрасывает блокировки провайдеров (только для администраторов)"""
+    try:
+        # Проверяем, является ли пользователь администратором (можно настроить по user_id)
+        admin_user_ids = [1298530968]  # Добавьте сюда ID администраторов
+        
+        if message.from_user.id not in admin_user_ids:
+            await message.answer("❌ У вас нет прав для выполнения этой команды.")
+            return
+        
+        # Сбрасываем блокировки провайдеров
+        from models import reset_provider_blocks
+        reset_provider_blocks()
+        
+        await message.answer("✅ Блокировки провайдеров сброшены. Все провайдеры снова доступны.")
+        logging.info(f"Администратор {message.from_user.id} сбросил блокировки провайдеров")
+        
+    except Exception as e:
+        logging.error(f"Ошибка при сбросе блокировок провайдеров: {e}")
+        await message.answer("😔 Не удалось сбросить блокировки провайдеров.")
 
 # Обработчик текстовых сообщений
 @dp.message(F.text)
@@ -1077,8 +1109,9 @@ def reset_token_usage():
     """Сбрасывает ежедневные счетчики использования токенов"""
     try:
         logging.info("Сброс ежедневных счетчиков токенов")
-        # Здесь можно добавить логику сброса счетчиков
-        # Пока просто логируем
+        # Импортируем функцию из models.py
+        from models import reset_token_usage as reset_tokens
+        reset_tokens()
         logging.info("Счетчики токенов сброшены")
     except Exception as e:
         logging.error(f"Ошибка при сбросе счетчиков токенов: {e}")
@@ -1121,6 +1154,16 @@ async def on_startup():
         id="cleanup_duplicates"
     )
     logging.info("Добавлена задача еженедельной очистки дубликатов")
+    
+    # Добавляем задачу для ежедневного сброса блокировок провайдеров в полночь
+    scheduler.add_job(
+        reset_provider_blocks,
+        "cron",
+        hour=0,
+        minute=0,
+        id="reset_provider_blocks"
+    )
+    logging.info("Добавлена задача ежедневного сброса блокировок провайдеров")
 
 @dp.shutdown()
 async def on_shutdown():

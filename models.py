@@ -3,11 +3,44 @@ import requests
 from typing import List, Tuple, Dict, Any
 from config import MODEL_CONFIG, TOKEN_LIMITS
 
+# Словарь для отслеживания заблокированных провайдеров (429 ошибки)
+BLOCKED_PROVIDERS = {}
+
+# Функция для блокировки провайдера на день
+def block_provider_for_day(provider: str, reason: str = "Rate limit exceeded"):
+    """Блокирует провайдера на весь день при получении 429 ошибки"""
+    BLOCKED_PROVIDERS[provider] = {
+        "blocked": True,
+        "reason": reason,
+        "timestamp": logging.Formatter().formatTime(logging.LogRecord("", 0, "", 0, "", (), None))
+    }
+    logging.warning(f"Провайдер {provider} заблокирован на день. Причина: {reason}")
+
+# Функция для проверки блокировки провайдера
+def is_provider_blocked(provider: str) -> bool:
+    """Проверяет, заблокирован ли провайдер"""
+    return BLOCKED_PROVIDERS.get(provider, {}).get("blocked", False)
+
+# Функция для сброса блокировок провайдеров (вызывается раз в день)
+def reset_provider_blocks():
+    """Сбрасывает все блокировки провайдеров"""
+    if BLOCKED_PROVIDERS:
+        logging.info(f"Сброс блокировок провайдеров. Заблокировано: {list(BLOCKED_PROVIDERS.keys())}")
+        BLOCKED_PROVIDERS.clear()
+        logging.info("Все блокировки провайдеров сброшены")
+    else:
+        logging.info("Нет заблокированных провайдеров для сброса")
+
 # Функция для проверки доступности модели
 async def check_model_availability(provider: str, model_name: str) -> bool:
     """Проверяет доступность модели и наличие токенов"""
     try:
         logging.info(f"Проверка доступности модели {model_name} у провайдера {provider}")
+        
+        # Проверяем, не заблокирован ли провайдер
+        if is_provider_blocked(provider):
+            logging.warning(f"Провайдер {provider} заблокирован на день. Причина: {BLOCKED_PROVIDERS[provider]['reason']}")
+            return False
         
         config = MODEL_CONFIG.get(provider)
         if not config or not config.get("client"):
@@ -87,6 +120,11 @@ async def call_model_with_failover(
     """
     logging.info(f"call_model_with_failover: тип модели: {model_type}, предпочтение: {model_preference}")
     logging.info(f"Количество сообщений: {len(messages)}")
+    
+    # Логируем заблокированные провайдеры
+    blocked_providers = [p for p in MODEL_CONFIG.keys() if is_provider_blocked(p)]
+    if blocked_providers:
+        logging.info(f"Заблокированные провайдеры: {blocked_providers}")
     
     # Формируем список всех моделей с учетом приоритета
     all_models = []
@@ -260,9 +298,11 @@ async def call_model_with_failover(
                 elif "authentication" in str(e).lower():
                     error_msg += f"\n❌ Ошибка аутентификации. Проверьте API ключ."
                     logging.error("Ошибка аутентификации в Cerebras")
-                elif "rate_limit" in str(e).lower():
-                    error_msg += f"\n❌ Превышен лимит запросов."
+                elif "rate_limit" in str(e).lower() or "429" in str(e):
+                    error_msg += f"\n❌ Превышен лимит запросов. Провайдер заблокирован на день."
                     logging.error("Превышен лимит запросов в Cerebras")
+                    # Блокируем провайдера на день
+                    block_provider_for_day(provider, "Rate limit exceeded (429)")
             
             # Дополнительная диагностика для OpenRouter
             elif provider == "openrouter":
@@ -273,8 +313,10 @@ async def call_model_with_failover(
                 
                 # Проверяем конкретные ошибки OpenRouter
                 if "rate_limit" in str(e).lower() or "429" in str(e):
-                    error_msg += f"\n❌ Превышен лимит запросов OpenRouter. Попробуйте завтра или добавьте кредиты."
+                    error_msg += f"\n❌ Превышен лимит запросов OpenRouter. Провайдер заблокирован на день."
                     logging.error("Превышен лимит запросов в OpenRouter")
+                    # Блокируем провайдера на день
+                    block_provider_for_day(provider, "Rate limit exceeded (429)")
                 elif "model_not_found" in str(e).lower():
                     error_msg += f"\n❌ Модель {model_name} не найдена в OpenRouter."
                     logging.error(f"Модель {model_name} не найдена в OpenRouter")
@@ -294,6 +336,11 @@ async def call_model_with_failover(
                 elif "authentication" in str(e).lower():
                     error_msg += f"\n❌ Ошибка аутентификации. Проверьте API ключ."
                     logging.error("Ошибка аутентификации в Groq")
+                elif "rate_limit" in str(e).lower() or "429" in str(e):
+                    error_msg += f"\n❌ Превышен лимит запросов. Провайдер заблокирован на день."
+                    logging.error("Превышен лимит запросов в Groq")
+                    # Блокируем провайдера на день
+                    block_provider_for_day(provider, "Rate limit exceeded (429)")
             
             logging.warning(error_msg)
             continue
