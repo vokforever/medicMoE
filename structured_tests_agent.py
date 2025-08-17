@@ -78,12 +78,12 @@ class TestExtractionAgent:
         try:
             logging.info(f"Извлечение анализов из текста длиной {len(text)} символов")
             
-            # Используем простой парсинг для быстрого извлечения
-            tests_data = self._parse_tests_simple(text)
+            # Используем улучшенный парсинг для извлечения данных
+            tests_data = self._parse_tests_improved(text)
             
-            # Если простой парсинг не дал результатов, используем ИИ
+            # Если улучшенный парсинг не дал результатов, используем ИИ
             if not tests_data:
-                logging.info("Простой парсинг не дал результатов, использую ИИ")
+                logging.info("Улучшенный парсинг не дал результатов, использую ИИ")
                 tests_data = await self._parse_tests_with_ai(text)
             
             # Добавляем ID исходной записи
@@ -97,8 +97,31 @@ class TestExtractionAgent:
             logging.error(f"Ошибка при извлечении анализов из текста: {e}")
             return []
     
+    def _parse_tests_improved(self, text: str) -> List[Dict[str, Any]]:
+        """Улучшенный парсинг анализов с извлечением всех данных"""
+        try:
+            tests = []
+            lines = text.split('\n')
+            
+            for i, line in enumerate(lines):
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # Ищем строки с результатами анализов
+                if any(keyword in line.lower() for keyword in ['anti-', 'igg', 'igm', 'ige', 'гепатит', 'аллергия', 'opisthorchis', 'toxocara', 'lamblia', 'ascaris']):
+                    test_data = self._extract_test_from_line_improved(line, lines, i)
+                    if test_data:
+                        tests.append(test_data)
+            
+            return tests
+            
+        except Exception as e:
+            logging.error(f"Ошибка при улучшенном парсинге: {e}")
+            return []
+    
     def _parse_tests_simple(self, text: str) -> List[Dict[str, Any]]:
-        """Простой парсинг анализов по ключевым словам"""
+        """Простой парсинг анализов по ключевым словам (для обратной совместимости)"""
         try:
             tests = []
             lines = text.split('\n')
@@ -120,8 +143,52 @@ class TestExtractionAgent:
             logging.error(f"Ошибка при простом парсинге: {e}")
             return []
     
+    def _extract_test_from_line_improved(self, line: str, all_lines: List[str], line_index: int) -> Optional[Dict[str, Any]]:
+        """Улучшенное извлечение данных анализа из строки с контекстом"""
+        try:
+            # Ищем паттерны типа "Anti-HCV total (анти-HCV): ОТРИЦАТЕЛЬНО"
+            if ':' in line:
+                parts = line.split(':', 1)
+                if len(parts) == 2:
+                    test_name = parts[0].strip()
+                    result = parts[1].strip()
+                    
+                    # Очищаем название теста
+                    test_name = re.sub(r'^\d+\.\s*', '', test_name)  # Убираем номера
+                    test_name = re.sub(r'[**]', '', test_name).strip()  # Убираем звездочки
+                    
+                    # Определяем единицы измерения
+                    units = self._extract_units(result)
+                    
+                    # Определяем референсные значения
+                    reference_values = self._extract_reference_values(result)
+                    
+                    # Очищаем результат
+                    clean_result = self._clean_result(result)
+                    
+                    # Ищем дополнительную информацию в соседних строках
+                    test_system = self._find_test_system(all_lines, line_index)
+                    equipment = self._find_equipment(all_lines, line_index)
+                    
+                    if test_name and clean_result:
+                        return {
+                            "test_name": test_name,
+                            "result": clean_result,
+                            "reference_values": reference_values,
+                            "units": units,
+                            "test_system": test_system,
+                            "equipment": equipment,
+                            "notes": None
+                        }
+            
+            return None
+            
+        except Exception as e:
+            logging.error(f"Ошибка при улучшенном извлечении теста из строки: {e}")
+            return None
+    
     def _extract_test_from_line(self, line: str) -> Optional[Dict[str, Any]]:
-        """Извлекает данные анализа из одной строки"""
+        """Извлекает данные анализа из одной строки (для обратной совместимости)"""
         try:
             # Ищем паттерны типа "Anti-HCV total (анти-HCV): ОТРИЦАТЕЛЬНО"
             if ':' in line:
@@ -202,6 +269,40 @@ class TestExtractionAgent:
         
         return clean_result
     
+    def _find_test_system(self, all_lines: List[str], current_line_index: int) -> Optional[str]:
+        """Ищет тест-систему в соседних строках"""
+        try:
+            # Ищем в текущей и соседних строках
+            for i in range(max(0, current_line_index - 2), min(len(all_lines), current_line_index + 3)):
+                line = all_lines[i].strip().lower()
+                if 'тест-система' in line or 'test-system' in line:
+                    # Извлекаем название тест-системы
+                    if ':' in all_lines[i]:
+                        parts = all_lines[i].split(':', 1)
+                        if len(parts) == 2:
+                            return parts[1].strip()
+            return None
+        except Exception as e:
+            logging.error(f"Ошибка при поиске тест-системы: {e}")
+            return None
+    
+    def _find_equipment(self, all_lines: List[str], current_line_index: int) -> Optional[str]:
+        """Ищет оборудование в соседних строках"""
+        try:
+            # Ищем в текущей и соседних строках
+            for i in range(max(0, current_line_index - 2), min(len(all_lines), current_line_index + 3)):
+                line = all_lines[i].strip().lower()
+                if 'оборудование' in line or 'equipment' in line:
+                    # Извлекаем название оборудования
+                    if ':' in all_lines[i]:
+                        parts = all_lines[i].split(':', 1)
+                        if len(parts) == 2:
+                            return parts[1].strip()
+            return None
+        except Exception as e:
+            logging.error(f"Ошибка при поиске оборудования: {e}")
+            return None
+    
     async def _parse_tests_with_ai(self, text: str) -> List[Dict[str, Any]]:
         """Извлечение анализов с помощью ИИ"""
         try:
@@ -223,12 +324,12 @@ class TestExtractionAgent:
             for test in tests:
                 try:
                     # Проверяем, есть ли уже такой анализ
-                    existing = self.supabase.table("structured_test_results").select("*").eq(
+                    existing = self.supabase.table("doc_structured_test_results").select("*").eq(
                         "user_id", user_id).eq("test_name", test.get("test_name")).execute()
                     
                     if existing.data:
                         # Обновляем существующую запись
-                        self.supabase.table("structured_test_results").update({
+                        self.supabase.table("doc_structured_test_results").update({
                             "result": test.get("result"),
                             "reference_values": test.get("reference_values"),
                             "units": test.get("units"),
@@ -242,7 +343,7 @@ class TestExtractionAgent:
                         logging.info(f"Обновлен анализ: {test.get('test_name')}")
                     else:
                         # Создаем новую запись
-                        self.supabase.table("structured_test_results").insert({
+                        self.supabase.table("doc_structured_test_results").insert({
                             "user_id": user_id,
                             "test_name": test.get("test_name"),
                             "result": test.get("result"),
@@ -277,7 +378,7 @@ class TestExtractionAgent:
             missing_data = []
             
             # Получаем все структурированные тесты
-            tests = self.supabase.table("structured_test_results").select("*").eq("user_id", user_id).execute()
+            tests = self.supabase.table("doc_structured_test_results").select("*").eq("user_id", user_id).execute()
             
             for test in tests.data:
                 missing_fields = []
@@ -321,7 +422,7 @@ class StructuredTestAgent:
             await self.extraction_agent.extract_and_structure_tests(user_id)
             
             # Получаем все структурированные тесты
-            tests = self.supabase.table("structured_test_results").select("*").eq(
+            tests = self.supabase.table("doc_structured_test_results").select("*").eq(
                 "user_id", user_id).order("test_name").execute()
             
             if not tests.data:
@@ -369,7 +470,7 @@ class StructuredTestAgent:
             await self.extraction_agent.extract_and_structure_tests(user_id)
             
             # Ищем анализ по названию
-            tests = self.supabase.table("structured_test_results").select("*").eq(
+            tests = self.supabase.table("doc_structured_test_results").select("*").eq(
                 "user_id", user_id).ilike("test_name", f"%{test_name}%").execute()
             
             if tests.data:
@@ -398,7 +499,7 @@ class StructuredTestAgent:
         """
         try:
             # Получаем информацию о тесте
-            test = self.supabase.table("structured_test_results").select("*").eq("id", test_id).execute()
+            test = self.supabase.table("doc_structured_test_results").select("*").eq("id", test_id).execute()
             
             if not test.data:
                 return "Анализ не найден."
@@ -440,7 +541,7 @@ class StructuredTestAgent:
             logging.info(f"Обновление данных анализа {test_id} для пользователя {user_id}")
             
             # Проверяем, что тест принадлежит пользователю
-            test = self.supabase.table("structured_test_results").select("*").eq(
+            test = self.supabase.table("doc_structured_test_results").select("*").eq(
                 "id", test_id).eq("user_id", user_id).execute()
             
             if not test.data:
@@ -464,7 +565,7 @@ class StructuredTestAgent:
                     return False
             
             # Обновляем данные
-            self.supabase.table("structured_test_results").update({
+            self.supabase.table("doc_structured_test_results").update({
                 **update_data,
                 "updated_at": datetime.now().isoformat()
             }).eq("id", test_id).execute()
@@ -484,7 +585,7 @@ class StructuredTestAgent:
             logging.info(f"Формирование сводки анализов для пользователя: {user_id}")
             
             # Получаем все структурированные тесты
-            tests = self.supabase.table("structured_test_results").select("*").eq(
+            tests = self.supabase.table("doc_structured_test_results").select("*").eq(
                 "user_id", user_id).order("test_name").execute()
             
             if not tests.data:
