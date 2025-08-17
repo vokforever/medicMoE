@@ -108,12 +108,24 @@ class TestExtractionAgent:
                 if not line:
                     continue
                 
-                # Ищем строки с результатами анализов
-                if any(keyword in line.lower() for keyword in ['anti-', 'igg', 'igm', 'ige', 'гепатит', 'аллергия', 'opisthorchis', 'toxocara', 'lamblia', 'ascaris']):
+                # Ищем строки с результатами анализов (расширяем поиск)
+                if any(keyword in line.lower() for keyword in [
+                    'anti-', 'igg', 'igm', 'ige', 'гепатит', 'аллергия', 'opisthorchis', 
+                    'toxocara', 'lamblia', 'ascaris', 'hepatitis', 'ferritin', 'tsh',
+                    'церулоплазмин', 'с-реактивный белок', 'c-реактивный белок'
+                ]):
                     test_data = self._extract_test_from_line_improved(line, lines, i)
                     if test_data:
                         tests.append(test_data)
+                        logging.info(f"Извлечен тест: {test_data['test_name']} = {test_data['result']}")
+                    else:
+                        # Если не удалось извлечь, попробуем простой метод
+                        test_data = self._extract_test_from_line(line)
+                        if test_data:
+                            tests.append(test_data)
+                            logging.info(f"Извлечен тест простым методом: {test_data['test_name']} = {test_data['result']}")
             
+            logging.info(f"Всего извлечено тестов: {len(tests)}")
             return tests
             
         except Exception as e:
@@ -166,11 +178,29 @@ class TestExtractionAgent:
                     # Очищаем результат
                     clean_result = self._clean_result(result)
                     
+                    # Если результат содержит только звездочки, ищем реальное значение в контексте
+                    if clean_result == "Не указан" and ("**" in result or "*" in result):
+                        real_result = self._extract_real_value_from_context(all_lines, line_index, "result")
+                        if real_result:
+                            clean_result = real_result
+                    
                     # Ищем дополнительную информацию в соседних строках
                     test_system = self._find_test_system(all_lines, line_index)
                     equipment = self._find_equipment(all_lines, line_index)
                     
-                    if test_name and clean_result:
+                    # Если не нашли тест-систему или оборудование, ищем в контексте
+                    if not test_system or test_system == "**" or test_system == "*":
+                        real_test_system = self._extract_real_value_from_context(all_lines, line_index, "test_system")
+                        if real_test_system:
+                            test_system = real_test_system
+                    
+                    if not equipment or equipment == "**" or equipment == "*":
+                        real_equipment = self._extract_real_value_from_context(all_lines, line_index, "equipment")
+                        if real_equipment:
+                            equipment = real_equipment
+                    
+                    # Проверяем, что результат не пустой и не содержит только звездочки
+                    if test_name and clean_result and clean_result != "Не указан":
                         return {
                             "test_name": test_name,
                             "result": clean_result,
@@ -259,15 +289,81 @@ class TestExtractionAgent:
     
     def _clean_result(self, result: str) -> str:
         """Очищает результат от лишней информации"""
+        if not result:
+            return "Не указан"
+        
+        # Убираем звездочки
+        clean_result = result.replace('**', '').replace('*', '').strip()
+        
         # Убираем единицы измерения и референсные значения
-        clean_result = re.sub(r'\s*\d+\s*(МЕ/мл|мл|мг/л|ммоль/л|г/л|%)', '', result)
+        clean_result = re.sub(r'\s*\d+\s*(МЕ/мл|мл|мг/л|ммоль/л|г/л|%)', '', clean_result)
         clean_result = re.sub(r'\s*норма[:\s]*[^,\n]+', '', clean_result)
         clean_result = re.sub(r'\s*референс[:\s]*[^,\n]+', '', clean_result)
         
         # Очищаем от лишних пробелов
         clean_result = re.sub(r'\s+', ' ', clean_result).strip()
         
+        # Если результат пустой после очистки, возвращаем "Не указан"
+        if not clean_result:
+            clean_result = "Не указан"
+        
         return clean_result
+    
+    def _extract_real_value_from_context(self, all_lines: List[str], line_index: int, field_name: str) -> Optional[str]:
+        """Извлекает реальное значение поля из контекста строк"""
+        try:
+            # Ищем в текущей и соседних строках (расширяем поиск)
+            search_range = 5  # Увеличиваем диапазон поиска
+            
+            for i in range(max(0, line_index - search_range), min(len(all_lines), line_index + search_range + 1)):
+                line = all_lines[i].strip()
+                if not line:
+                    continue
+                
+                # Ищем конкретные поля
+                if field_name == "test_system":
+                    if any(keyword in line.lower() for keyword in ['тест-система', 'test-system', 'abbott', 'roche', 'cobas']):
+                        if ':' in line:
+                            parts = line.split(':', 1)
+                            if len(parts) == 2:
+                                value = parts[1].strip()
+                                if value and value != "**" and value != "*":
+                                    return value
+                        else:
+                            # Если нет двоеточия, берем всю строку
+                            if line and line != "**" and line != "*":
+                                return line
+                
+                elif field_name == "equipment":
+                    if any(keyword in line.lower() for keyword in ['оборудование', 'equipment', 'alinity', 'cobas']):
+                        if ':' in line:
+                            parts = line.split(':', 1)
+                            if len(parts) == 2:
+                                value = parts[1].strip()
+                                if value and value != "**" and value != "*":
+                                    return value
+                        else:
+                            if line and line != "**" and line != "*":
+                                return line
+                
+                elif field_name == "result":
+                    # Ищем результат в соседних строках
+                    if any(keyword in line.lower() for keyword in ['отрицательно', 'положительно', 'negative', 'positive', 'норма', 'норме']):
+                        if ':' in line:
+                            parts = line.split(':', 1)
+                            if len(parts) == 2:
+                                value = parts[1].strip()
+                                if value and value != "**" and value != "*":
+                                    return value
+                        else:
+                            if line and line != "**" and line != "*":
+                                return line
+            
+            return None
+            
+        except Exception as e:
+            logging.error(f"Ошибка при извлечении реального значения для {field_name}: {e}")
+            return None
     
     def _find_test_system(self, all_lines: List[str], current_line_index: int) -> Optional[str]:
         """Ищет тест-систему в соседних строках"""

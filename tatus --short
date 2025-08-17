@@ -1,0 +1,351 @@
+[1mdiff --git a/main.py b/main.py[m
+[1mindex 07cf185..9c1f336 100644[m
+[1m--- a/main.py[m
+[1m+++ b/main.py[m
+[36m@@ -1,550 +1,502 @@[m
+ import os[m
+ import asyncio[m
+[31m-import requests[m
+[31m-import json[m
+[31m-import uuid[m
+ from datetime import datetime, timedelta[m
+ from aiogram import Bot, Dispatcher, types, F[m
+ from aiogram.filters import Command[m
+ from aiogram.fsm.context import FSMContext[m
+ from aiogram.fsm.state import StatesGroup, State[m
+[31m-from aiogram.utils.keyboard import InlineKeyboardBuilder[m
+[31m-from openai import OpenAI[m
+[31m-from tavily import TavilyClient[m
+[31m-from supabase import create_client, Client[m
+ from apscheduler.schedulers.asyncio import AsyncIOScheduler[m
+[31m-import aiohttp[m
+[31m-from bs4 import BeautifulSoup[m
+[31m-import logging[m
+[31m-import numpy as np[m
+[31m-from typing import List, Tuple, Dict, Any, Optional[m
+[31m-from dotenv import load_dotenv[m
+[31m-import PyPDF2[m
+[31m-import io[m
+[31m-import base64[m
+[31m-import re[m
+[31m-from dateutil.parser import parse[m
+[31m-from pytz import timezone[m
+ [m
+[31m-# Загрузка переменных окружения[m
+[31m-load_dotenv()[m
+[31m-[m
+[31m-# Настройка логирования[m
+[31m-logging.basicConfig(level=logging.INFO)[m
+[31m-[m
+[31m-# Инициализация клиентов[m
+[31m-bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))[m
+[31m-dp = Dispatcher()[m
+[31m-scheduler = AsyncIOScheduler()[m
+[31m-[m
+[31m-# OpenRouter[m
+[31m-openrouter_client = OpenAI([m
+[31m-    base_url="https://openrouter.ai/api/v1",[m
+[31m-    api_key=os.getenv("OPENROUTER_API_KEY"),[m
+[32m+[m[32m# Импорты из наших модулей[m
+[32m+[m[32mfrom config import bot_token, supabase, reset_token_usage[m
+[32m+[m[32mfrom models import call_model_with_failover[m
+[32m+[m[32mfrom agents import ClarificationAgent, TestAnalysisAgent, IntelligentQueryAnalyzer[m
+[32m+[m[32mfrom database import ([m
+[32m+[m[32m    generate_user_uuid, create_patient_profile, update_patient_profile,[m
+[32m+[m[32m    get_patient_profile, save_test_results, get_patient_tests,[m
+[32m+[m[32m    get_medical_records, save_medical_record, save_to_knowledge_base,[m
+[32m+[m[32m    save_user_feedback, get_user_successful_responses, save_successful_response[m
+ )[m
+[31m-[m
+[31m-# Tavily API[m
+[31m-tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))[m
+[31m-[m
+[31m-# Supabase[m
+[31m-supabase: Client = create_client([m
+[31m-    supabase_url=os.getenv("SUPABASE_URL"),[m
+[31m-    supabase_key=os.getenv("SUPABASE_KEY")[m
+[32m+[m[32mfrom utils import ([m
+[32m+[m[32m    escape_html, search_medical_sources, search_web, search_knowledge_base,[m
+[32m+[m[32m    extract_patient_data_from_text, analyze_image, extract_text_from_pdf,[m
+[32m+[m[32m    check_duplicate_medical_record_ai_enhanced[m
+[32m+[m[32m)[m
+[32m+[m[32mfrom keyboards import ([m
+[32m+[m[32m    get_feedback_keyboard, get_clarification_keyboard, get_main_keyboard,[m
+[32m+[m[32m    get_profile_confirmation_keyboard, get_profile_update_keyboard,[m
+[32m+[m[32m    get_pdf_analysis_keyboard, get_complete_data_keyboard, get_add_date_keyboard[m
+ )[m
+ [m
+[31m-# Медицинские источники[m
+[31m-MEDICAL_SOURCES = [[m
+[31m-    "https://www.who.int/ru",[m
+[31m-    "https://medportal.ru",[m
+[31m-    "https://www.webmd.com",[m
+[31m-    "https://www.mayoclinic.org"[m
+[31m-][m
+[31m-[m
+[31m-# Конфигурация моделей для failover[m
+[31m-# Vision модели (qwen, gemini) используются только для анализа изображений[m
+[31m-# Text модели (deepseek, gpt, glm, kimi) используются для текстовых задач[m
+[31m-# [m
+[31m-# ВАЖНО: Разные провайдеры используют разные названия параметров:[m
+[31m-# - OpenAI/OpenRouter: max_tokens[m
+[31m-# - Cerebras: max_tokens (не max_completion_tokens)[m
+[31m-# - Groq: max_tokens[m
+[31m-MODEL_CONFIG = {[m
+[31m-    "openrouter": {[m
+[31m-        "api_key": os.getenv("OPENROUTER_API_KEY"),[m
+[31m-        "base_url": "https://openrouter.ai/api/v1",[m
+[31m-        "models": [[m
+[31m-            {"name": "qwen/qwen2.5-vl-72b-instruct:free", "priority": 1, "type": "vision"},[m
+[31m-            {"name": "google/gemini-2.0-flash-exp:free", "priority": 2, "type": "vision"},[m
+[31m-            {"name": "deepseek/deepseek-chat-v3-0324:free", "priority": 3, "type": "text"},[m
+[31m-            {"name": "deepseek/deepseek-r1-0528:free", "priority": 4, "type": "text"},[m
+[31m-            {"name": "openai/gpt-oss-20b:free", "priority": 5, "type": "text"},[m
+[31m-            {"name": "z-ai/glm-4.5-air:free", "priority": 6, "type": "text"},[m
+[31m-            {"name": "moonshotai/kimi-k2:free", "priority": 7, "type": "text"}[m
+[31m-        ],[m
+[31m-        "client": openrouter_client[m
+[31m-    },[m
+[31m-    "groq": {[m
+[31m-        "api_key": os.getenv("GROQ_API_KEY"),[m
+[31m-        "base_url": "https://api.groq.com/openai/v1",[m
+[31m-        "models": [[m
+[31m-            {"name": "meta-llama/llama-4-scout-17b-16e-instruct:free", "priority": 1, "type": "vision"},[m
+[31m-            {"name": "meta-llama/llama-4-maverick-17b-128e-instruct:free", "priority": 2, "type": "vision"},[m
+[31m-            {"name": "llama-3.2-90b-vision-preview:free", "priority": 3, "type": "vision"},[m
+[31m-            {"name": "deepseek-r1-distill-llama-70b", "priority": 4, "type": "text"},[m
+[31m-            {"name": "openai/gpt-oss-120b", "priority": 5, "type": "text"}[m
+[31m-        ],[m
+[31m-        "client": None  # Будет инициализирован позже[m
+[31m-    },[m
+[31m-    "cerebras": {[m
+[31m-        "api_key": os.getenv("CEREBRAS_API_KEY"),[m
+[31m-        "base_url": "https://api.cerebras.ai/v1",[m
+[31m-        "models": [[m
+[31m-            {"name": "qwen-3-235b-a22b-thinking-2507", "priority": 1, "type": "text"},[m
+[31m-            {"name": "qwen-3-235b-a22b-instruct-2507", "priority": 2, "type": "text"}[m
+[31m-[m
+[31m-        ],[m
+[31m-        "client": None  # Будет инициализирован позже[m
+[31m-    }[m
+[31m-}[m
+[31m-[m
+[31m-# Инициализация клиентов для Cerebras и Groq[m
+[31m-if MODEL_CONFIG["cerebras"]["api_key"]:[m
+[31m-    MODEL_CONFIG["cerebras"]["client"] = OpenAI([m
+[31m-        base_url=MODEL_CONFIG["cerebras"]["base_url"],[m
+[31m-        api_key=MODEL_CONFIG["cerebras"]["api_key"][m
+[31m-    )[m
+[32m+[m[32m# Импорт и инициализация агента для структурированных данных[m
+[32m+[m[32mfrom structured_tests_agent import StructuredTestAgent[m
+ [m
+[31m-# Функция для генерации UUID на основе Telegram user ID[m
+[31m-def generate_user_uuid(telegram_user_id: int) -> str:[m
+[31m-    """[m
+[31m-    Генерирует детерминированный UUID на основе Telegram user ID.[m
+[31m-    Один и тот же Telegram user ID всегда будет генерировать один и тот же UUID.[m
+[31m-    """[m
+[31m-    # Создаем namespace UUID для Telegram (используем фиксированный UUID)[m
+[31m-    telegram_namespace = uuid.UUID('550e8400-e29b-41d4-a716-446655440000')[m
+[32m+[m[32m# Класс для управления сессиями[m
+[32m+[m[32mclass SessionManager:[m
+[32m+[m[32m    """Менеджер сессий для управления контекстом пользователей"""[m
+     [m
+[31m-    # Создаем UUID на основе namespace и user_id[m
+[31m-    generated_uuid = str(uuid.uuid5(telegram_namespace, str(telegram_user_id)))[m
+[32m+[m[32m    def __init__(self, supabase_client):[m
+[32m+[m[32m        self.supabase = supabase_client[m
+[32m+[m[32m        self.active_sessions = {}  # user_id: session_data[m
+[32m+[m[32m        self.max_history_length = 50  # Максимальное количество сообщений в истории[m
+[32m+[m[41m        [m
+[32m+[m[32m    async def load_session_history(self, user_id: str) -> List[Dict]:[m
+[32m+[m[32m        """Загрузка истории диалога из Supabase"""[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            logging.info(f"Загрузка истории диалога для пользователя: {user_id}")[m
+[32m+[m[41m            [m
+[32m+[m[32m            response = self.supabase.table("doc_conversation_history").select("*") \[m
+[32m+[m[32m                .eq("user_id", user_id) \[m
+[32m+[m[32m                .order("created_at", desc=True) \[m
+[32m+[m[32m                .limit(self.max_history_length) \[m
+[32m+[m[32m                .execute()[m
+[32m+[m[41m            [m
+[32m+[m[32m            history = response.data if response.data else [][m
+[32m+[m[32m            logging.info(f"Загружено {len(history)} сообщений из истории")[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Сортируем по времени создания (от старых к новым)[m
+[32m+[m[32m            history.sort(key=lambda x: x.get("created_at", ""))[m
+[32m+[m[41m            [m
+[32m+[m[32m            return history[m
+[32m+[m[41m            [m
+[32m+[m[32m        except Exception as e:[m
+[32m+[m[32m            logging.error(f"Ошибка загрузки истории: {e}")[m
+[32m+[m[32m            return [][m
+     [m
+[31m-    logging.info(f"Сгенерирован UUID для Telegram user ID {telegram_user_id}: {generated_uuid}")[m
+[32m+[m[32m    async def save_session_message(self, user_id: str, message: Dict):[m
+[32m+[m[32m        """Сохранение сообщения в историю"""[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            logging.info(f"Сохранение сообщения в историю для пользователя: {user_id}")[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Подготавливаем данные для сохранения[m
+[32m+[m[32m            message_data = {[m
+[32m+[m[32m                "user_id": user_id,[m
+[32m+[m[32m                "role": message.get("role", "user"),[m
+[32m+[m[32m                "content": message.get("content", ""),[m
+[32m+[m[32m                "message_type": message.get("type", "text"),[m
+[32m+[m[32m                "created_at": datetime.now().isoformat()[m
+[32m+[m[32m            }[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Сохраняем в базу[m
+[32m+[m[32m            self.supabase.table("doc_conversation_history").insert(message_data).execute()[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Обновляем активную сессию[m
+[32m+[m[32m            if user_id not in self.active_sessions:[m
+[32m+[m[32m                self.active_sessions[user_id] = {"history": [], "context": {}}[m
+[32m+[m[41m            [m
+[32m+[m[32m            self.active_sessions[user_id]["history"].append(message_data)[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Ограничиваем размер истории в памяти[m
+[32m+[m[32m            if len(self.active_sessions[user_id]["history"]) > self.max_history_length:[m
+[32m+[m[32m                self.active_sessions[user_id]["history"] = self.active_sessions[user_id]["history"][-self.max_history_length:][m
+[32m+[m[41m            [m
+[32m+[m[32m            logging.info("Сообщение успешно сохранено в историю")[m
+[32m+[m[41m            [m
+[32m+[m[32m        except Exception as e:[m
+[32m+[m[32m            logging.error(f"Ошибка сохранения сообщения: {e}")[m
+     [m
+[31m-    return generated_uuid[m
+[31m-[m
+[31m-if MODEL_CONFIG["groq"]["api_key"]:[m
+[31m-    MODEL_CONFIG["groq"]["client"] = OpenAI([m
+[31m-        base_url=MODEL_CONFIG["groq"]["base_url"],[m
+[31m-        api_key=MODEL_CONFIG["groq"]["api_key"][m
+[31m-    )[m
+[31m-[m
+[31m-# Параметры токенов (если есть)[m
+[31m-TOKEN_LIMITS = {[m
+[31m-    "openrouter": {[m
+[31m-        "daily_limit": int(os.getenv("OPENROUTER_DAILY_LIMIT", "100000")),[m
+[31m-        "used_today": 0[m
+[31m-    },[m
+[31m-    "cerebras": {[m
+[31m-        "daily_limit": int(os.getenv("CEREBRAS_DAILY_LIMIT", "50000")),[m
+[31m-        "used_today": 0[m
+[31m-    },[m
+[31m-    "groq": {[m
+[31m-        "daily_limit": int(os.getenv("GROQ_DAILY_LIMIT", "50000")),[m
+[31m-        "used_today": 0[m
+[31m-    }[m
+[31m-}[m
+[31m-[m
+[31m-# Константы[m
+[31m-MAX_HISTORY_LENGTH = 10[m
+[31m-MAX_CONTEXT_MESSAGES = 6[m
+[31m-AGENT_CACHE_EXPIRE_HOURS = 24[m
+[31m-[m
+[31m-[m
+[31m-# Состояния для FSM[m
+[31m-class DoctorStates(StatesGroup):[m
+[31m-    waiting_for_feedback = State()[m
+[31m-    waiting_for_clarification = State()[m
+[31m-    waiting_for_file = State()[m
+[31m-    waiting_for_patient_id = State()[m
+[31m-    viewing_history = State()[m
+[31m-    confirming_profile = State()[m
+[31m-    updating_profile = State()[m
+[31m-    waiting_for_test_data = State()  # Ожидание дополнения данных анализов[m
+[31m-[m
+[31m-[m
+[31m-# Функция для экранирования HTML[m
+[31m-def escape_html(text: str) -> str:[m
+[31m-    logging.debug(f"Экранирование HTML для текста длиной {len(text)} символов")[m
+[32m+[m[32m    async def get_session_context(self, user_id: str) -> str:[m
+[32m+[m[32m        """Получение полного контекста сессии"""[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            logging.info(f"Формирование контекста сессии для пользователя: {user_id}")[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Загружаем историю, если её нет в памяти[m
+[32m+[m[32m            if user_id not in self.active_sessions or not self.active_sessions[user_id].get("history"):[m
+[32m+[m[32m                history = await self.load_session_history(user_id)[m
+[32m+[m[32m                if user_id not in self.active_sessions:[m
+[32m+[m[32m                    self.active_sessions[user_id] = {"history": [], "context": {}}[m
+[32m+[m[32m                self.active_sessions[user_id]["history"] = history[m
+[32m+[m[41m            [m
+[32m+[m[32m            history = self.active_sessions[user_id]["history"][m
+[32m+[m[41m            [m
+[32m+[m[32m            if not history:[m
+[32m+[m[32m                logging.info("История диалога пуста")[m
+[32m+[m[32m                return "История диалога пуста."[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Формируем контекст из последних сообщений[m
+[32m+[m[32m            recent_messages = history[-10:]  # Берем последние 10 сообщений[m
+[32m+[m[41m            [m
+[32m+[m[32m            context = "История диалога:\n"[m
+[32m+[m[32m            for msg in recent_messages:[m
+[32m+[m[32m                role = msg.get("role", "unknown")[m
+[32m+[m[32m                content = msg.get("content", "")[:200]  # Ограничиваем длину[m
+[32m+[m[32m                context += f"{role}: {content}\n"[m
+[32m+[m[41m            [m
+[32m+[m[32m            logging.info(f"Сформирован контекст длиной {len(context)} символов")[m
+[32m+[m[32m            return context[m
+[32m+[m[41m            [m
+[32m+[m[32m        except Exception as e:[m
+[32m+[m[32m            logging.error(f"Ошибка формирования контекста сессии: {e}")[m
+[32m+[m[32m            return "Ошибка формирования контекста сессии."[m
+     [m
+[31m-    escaped = ([m
+[31m-        text.replace("&", "&amp;")[m
+[31m-        .replace("<", "&lt;")[m
+[31m-        .replace(">", "&gt;")[m
+[31m-    )[m
+[32m+[m[32m    async def get_user_profile_context(self, user_id: str) -> str:[m
+[32m+[m[32m        """Получение контекста профиля пользователя"""[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            logging.info(f"Получение контекста профиля для пользователя: {user_id}")[m
+[32m+[m[41m            [m
+[32m+[m[32m            response = self.supabase.table("doc_patient_profiles").select("*").eq("user_id", user_id).execute()[m
+[32m+[m[41m            [m
+[32m+[m[32m            if response.data:[m
+[32m+[m[32m                profile = response.data[0][m
+[32m+[m[32m                context = f"Профиль пациента: {profile.get('name', 'Не указан')}, "[m
+[32m+[m[32m                context += f"возраст: {profile.get('age', 'Не указан')}, "[m
+[32m+[m[32m                context += f"пол: {profile.get('gender', 'Не указан')}"[m
+[32m+[m[41m                [m
+[32m+[m[32m                if profile.get('birth_date'):[m
+[32m+[m[32m                    context += f", дата рождения: {profile.get('birth_date')}"[m
+[32m+[m[41m                [m
+[32m+[m[32m                logging.info(f"Контекст профиля сформирован: {context}")[m
+[32m+[m[32m                return context[m
+[32m+[m[32m            else:[m
+[32m+[m[32m                logging.info("Профиль пациента не найден")[m
+[32m+[m[32m                return "Профиль пациента не найден."[m
+[32m+[m[41m                [m
+[32m+[m[32m        except Exception as e:[m
+[32m+[m[32m            logging.error(f"Ошибка получения контекста профиля: {e}")[m
+[32m+[m[32m            return "Ошибка загрузки профиля пациента."[m
+     [m
+[31m-    logging.debug(f"HTML экранирован, результат длиной {len(escaped)} символов")[m
+[31m-    return escaped[m
+[31m-[m
+[32m+[m[32m    async def get_medical_records_context(self, user_id: str) -> str:[m
+[32m+[m[32m        """Получение контекста медицинских записей пользователя"""[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            logging.info(f"Получение контекста медицинских записей для пользователя: {user_id}")[m
+[32m+[m[41m            [m
+[32m+[m[32m            response = self.supabase.table("doc_medical_records").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(5).execute()[m
+[32m+[m[41m            [m
+[32m+[m[32m            if response.data:[m
+[32m+[m[32m                records = response.data[m
+[32m+[m[32m                context = f"Медицинские записи: найдено {len(records)} записей\n"[m
+[32m+[m[41m                [m
+[32m+[m[32m                for i, record in enumerate(records[:3]):  # Показываем только последние 3[m
+[32m+[m[32m                    record_type = record.get("record_type", "неизвестно")[m
+[32m+[m[32m                    created_at = record.get("created_at", "")[m
+[32m+[m[32m                    content = record.get("content", "")[:300]  # Ограничиваем длину[m
+[32m+[m[41m                    [m
+[32m+[m[32m                    context += f"\n--- Запись {i+1} ---\n"[m
+[32m+[m[32m                    context += f"Тип: {record_type}\n"[m
+[32m+[m[32m                    context += f"Дата: {created_at}\n"[m
+[32m+[m[32m                    context += f"Содержание: {content}\n"[m
+[32m+[m[41m                [m
+[32m+[m[32m                logging.info(f

@@ -22,6 +22,45 @@ def escape_html(text: str) -> str:
     logging.debug(f"HTML экранирован, результат длиной {len(escaped)} символов")
     return escaped
 
+# Функция для экранирования Markdown
+def escape_markdown(text: str) -> str:
+    """Экранирует специальные символы для Markdown"""
+    logging.debug(f"Экранирование Markdown для текста длиной {len(text)} символов")
+    
+    # Символы, которые нужно экранировать в Markdown
+    escape_chars = r'\_*[]()~`>#+-=|{}.!'
+    
+    escaped = ''
+    for char in text:
+        if char in escape_chars:
+            escaped += f'\\{char}'
+        else:
+            escaped += char
+    
+    logging.debug(f"Markdown экранирован, результат длиной {len(escaped)} символов")
+    return escaped
+
+# Функция для очистки результата анализа от звездочек и лишних символов
+def clean_test_result(result: str) -> str:
+    """Очищает результат анализа от звездочек и лишних символов"""
+    logging.debug(f"Очистка результата анализа: {result}")
+    
+    if not result:
+        return result
+    
+    # Убираем звездочки
+    cleaned = result.replace('**', '').replace('*', '').strip()
+    
+    # Убираем лишние пробелы
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    
+    # Если результат пустой после очистки, возвращаем "Не указан"
+    if not cleaned:
+        cleaned = "Не указан"
+    
+    logging.debug(f"Результат очищен: {cleaned}")
+    return cleaned
+
 # Функция для получения эмбеддинга
 def get_embedding(text: str) -> List[float]:
     """Получение эмбеддинга текста с помощью Mistral AI"""
