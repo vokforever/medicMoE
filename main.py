@@ -153,6 +153,7 @@ class DoctorStates(StatesGroup):
     waiting_for_patient_id = State()
     viewing_history = State()
     confirming_profile = State()
+    updating_profile = State()
 
 
 # Функция для экранирования HTML
@@ -961,15 +962,19 @@ async def extract_patient_data_from_text(text: str) -> Dict[str, Any]:
                 
                 ТЕКУЩАЯ ДАТА: {datetime.now().strftime('%d.%m.%Y')} (год: {datetime.now().year})
                 
-                Извлеки имя, возраст и пол, если они есть. 
+                Извлеки имя, возраст, пол и дату рождения, если они есть. 
                 
-                ВАЖНО: При извлечении возраста учитывай текущую дату. Если в документе указан возраст 
+                ВАЖНО: 
+                - При извлечении возраста учитывай текущую дату. Если в документе указан возраст 
                 "33 года", а сейчас {datetime.now().year} год, то возраст пациента сейчас больше 33 лет.
-                Корректируй возраст в зависимости от того, когда был создан документ.
+                - Дату рождения ищи в форматах: ДД.ММ.ГГГГ, ДД/ММ/ГГГГ, ДД-ММ-ГГГГ, или текстом "родился 15.03.1990"
+                - Если указан только год рождения, используй его для вычисления возраста
                 
                 Верни ответ в формате JSON: 
-                {{"name": "имя", "age": число, "gender": "М" или "Ж"}}. 
-                Если каких-то данных нет, поставь null."""
+                {{"name": "имя", "age": число, "gender": "М" или "Ж", "birth_date": "ГГГГ-ММ-ДД"}}. 
+                Если каких-то данных нет, поставь null.
+                
+                Примеры дат: "1990-03-15", "1985-12-01" """
             },
             {
                 "role": "user",
@@ -987,16 +992,32 @@ async def extract_patient_data_from_text(text: str) -> Dict[str, Any]:
                 json_str = json_match.group(0)
                 data = json.loads(json_str)
                 
-                # Вычисляем текущий возраст на основе извлеченного возраста
+                # Обрабатываем дату рождения
+                birth_date = data.get("birth_date")
+                if birth_date:
+                    # Пытаемся распарсить дату в различных форматах
+                    parsed_date = parse_birth_date(birth_date)
+                    if parsed_date:
+                        birth_date = parsed_date
+                    else:
+                        birth_date = None
+                
+                # Вычисляем текущий возраст на основе извлеченного возраста или даты рождения
                 extracted_age = data.get("age")
                 current_age = None
-                if extracted_age and isinstance(extracted_age, int):
+                
+                if birth_date:
+                    # Если есть дата рождения, вычисляем точный возраст
+                    current_age = calculate_age_from_birth_date(birth_date)
+                elif extracted_age and isinstance(extracted_age, int):
+                    # Если есть только возраст, вычисляем примерный
                     current_age = calculate_current_age(extracted_age)
                 
                 return {
                     "name": data.get("name"),
                     "age": current_age,
-                    "gender": data.get("gender")
+                    "gender": data.get("gender"),
+                    "birth_date": birth_date
                 }
         except json.JSONDecodeError:
             pass
@@ -1005,14 +1026,23 @@ async def extract_patient_data_from_text(text: str) -> Dict[str, Any]:
         name_match = re.search(r'(?:Пациент|ФИО|Имя):\s*([А-Яа-я\s]+)', text)
         age_match = re.search(r'(?:Возраст|Лет):\s*(\d+)', text)
         gender_match = re.search(r'(?:Пол):\s*([МЖ])', text)
+        
+        # Ищем дату рождения в различных форматах
+        birth_date = extract_birth_date_from_text(text)
 
         extracted_age = int(age_match.group(1)) if age_match else None
-        current_age = calculate_current_age(extracted_age) if extracted_age else None
+        current_age = None
+        
+        if birth_date:
+            current_age = calculate_age_from_birth_date(birth_date)
+        elif extracted_age:
+            current_age = calculate_current_age(extracted_age)
 
         return {
             "name": name_match.group(1).strip() if name_match else None,
             "age": current_age,
-            "gender": gender_match.group(1) if gender_match else None
+            "gender": gender_match.group(1) if gender_match else None,
+            "birth_date": birth_date
         }
     except Exception as e:
         logging.error(f"Ошибка при извлечении данных пациента: {e}")
@@ -1047,6 +1077,112 @@ def calculate_current_age(extracted_age: int) -> int:
     except Exception as e:
         logging.error(f"Ошибка при вычислении возраста: {e}")
         return extracted_age
+
+
+def parse_birth_date(date_str: str) -> Optional[str]:
+    """
+    Парсит дату рождения в различных форматах и возвращает в формате YYYY-MM-DD
+    """
+    try:
+        if not date_str:
+            return None
+            
+        # Убираем лишние пробелы
+        date_str = date_str.strip()
+        
+        # Пытаемся распарсить различные форматы
+        try:
+            # Пробуем стандартный парсер
+            parsed_date = parse(date_str, dayfirst=True, yearfirst=False)
+            return parsed_date.strftime('%Y-%m-%d')
+        except:
+            pass
+        
+        # Пытаемся распарсить вручную различные форматы
+        patterns = [
+            r'(\d{1,2})[\.\/\-](\d{1,2})[\.\/\-](\d{4})',  # ДД.ММ.ГГГГ
+            r'(\d{4})[\.\/\-](\d{1,2})[\.\/\-](\d{1,2})',  # ГГГГ.ММ.ДД
+            r'(\d{1,2})[\.\/\-](\d{1,2})[\.\/\-](\d{2})',  # ДД.ММ.ГГ
+            r'(\d{4})',  # Только год
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, date_str)
+            if match:
+                if len(match.groups()) == 3:
+                    if len(match.group(3)) == 4:  # ДД.ММ.ГГГГ
+                        day, month, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                    else:  # ГГГГ.ММ.ДД
+                        year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                    
+                    # Проверяем валидность даты
+                    if 1 <= month <= 12 and 1 <= day <= 31 and 1900 <= year <= datetime.now().year:
+                        return f"{year:04d}-{month:02d}-{day:02d}"
+                elif len(match.groups()) == 1:  # Только год
+                    year = int(match.group(1))
+                    if 1900 <= year <= datetime.now().year:
+                        return f"{year:04d}-01-01"  # Используем 1 января как примерную дату
+        
+        return None
+    except Exception as e:
+        logging.error(f"Ошибка при парсинге даты рождения: {e}")
+        return None
+
+
+def extract_birth_date_from_text(text: str) -> Optional[str]:
+    """
+    Извлекает дату рождения из текста с помощью регулярных выражений
+    """
+    try:
+        # Ищем различные форматы дат
+        patterns = [
+            r'(?:родился|дата рождения|д\.р\.|Д\.Р\.):\s*(\d{1,2}[\.\/\-]\d{1,2}[\.\/\-]\d{4})',
+            r'(?:родился|дата рождения|д\.р\.|Д\.Р\.):\s*(\d{4})',
+            r'(\d{1,2}[\.\/\-]\d{1,2}[\.\/\-]\d{4})',
+            r'(\d{4})'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                date_str = match.group(1)
+                parsed_date = parse_birth_date(date_str)
+                if parsed_date:
+                    return parsed_date
+        
+        return None
+    except Exception as e:
+        logging.error(f"Ошибка при извлечении даты рождения из текста: {e}")
+        return None
+
+
+def calculate_age_from_birth_date(birth_date: str) -> Optional[int]:
+    """
+    Вычисляет точный возраст на основе даты рождения
+    """
+    try:
+        if not birth_date:
+            return None
+            
+        # Парсим дату рождения
+        birth_dt = datetime.strptime(birth_date, '%Y-%m-%d')
+        current_dt = datetime.now()
+        
+        # Вычисляем возраст
+        age = current_dt.year - birth_dt.year
+        
+        # Корректируем, если день рождения еще не наступил в этом году
+        if (current_dt.month, current_dt.day) < (birth_dt.month, birth_dt.day):
+            age -= 1
+            
+        # Проверяем разумность результата
+        if age < 0 or age > 120:
+            return None
+            
+        return age
+    except Exception as e:
+        logging.error(f"Ошибка при вычислении возраста из даты рождения: {e}")
+        return None
 
 
 # Функция для анализа изображения
@@ -1099,7 +1235,7 @@ def search_knowledge_base(query: str) -> str:
 
 
 # Функция для создания профиля пациента
-def create_patient_profile(user_id: str, name: str, age: int, gender: str, telegram_id: int = None) -> bool:
+def create_patient_profile(user_id: str, name: str, age: int, gender: str, telegram_id: int = None, birth_date: str = None) -> bool:
     try:
         profile_data = {
             "user_id": user_id,
@@ -1113,11 +1249,68 @@ def create_patient_profile(user_id: str, name: str, age: int, gender: str, teleg
         if telegram_id:
             profile_data["telegram_id"] = telegram_id
             
+        # Добавляем дату рождения если она передана
+        if birth_date:
+            profile_data["birth_date"] = birth_date
+            
         response = supabase.table("doc_patient_profiles").insert(profile_data).execute()
         return len(response.data) > 0
     except Exception as e:
         logging.error(f"Ошибка при создании профиля пациента: {e}")
         return False
+
+
+def update_patient_profile(user_id: str, **updates) -> bool:
+    """
+    Обновляет профиль пациента новыми данными.
+    Поддерживает обновление: name, age, gender, birth_date, phone, email, address, medical_history, allergies
+    """
+    try:
+        # Подготавливаем данные для обновления
+        update_data = {}
+        
+        # Добавляем только те поля, которые переданы и не None
+        for key, value in updates.items():
+            if value is not None:
+                update_data[key] = value
+        
+        # Добавляем время обновления
+        update_data["updated_at"] = datetime.now().isoformat()
+        
+        if not update_data:
+            return True  # Нечего обновлять
+            
+        response = supabase.table("doc_patient_profiles").update(update_data).eq("user_id", user_id).execute()
+        return len(response.data) > 0
+    except Exception as e:
+        logging.error(f"Ошибка при обновлении профиля пациента: {e}")
+        return False
+
+
+def merge_patient_data(existing_data: Dict[str, Any], new_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Объединяет существующие данные пациента с новыми данными.
+    Новые данные имеют приоритет, но существующие данные сохраняются, если новых нет.
+    """
+    merged = existing_data.copy()
+    
+    for key, value in new_data.items():
+        if value is not None:
+            # Для даты рождения проверяем, что новая дата более точная
+            if key == "birth_date" and merged.get("birth_date"):
+                existing_date = merged["birth_date"]
+                if isinstance(existing_date, str) and len(existing_date) == 10:  # YYYY-MM-DD
+                    if isinstance(value, str) and len(value) == 10:  # YYYY-MM-DD
+                        # Новая дата более точная, обновляем
+                        merged[key] = value
+                elif isinstance(existing_date, str) and len(existing_date) == 4:  # YYYY
+                    if isinstance(value, str) and len(value) == 10:  # YYYY-MM-DD
+                        # Новая дата более точная, обновляем
+                        merged[key] = value
+            else:
+                merged[key] = value
+    
+    return merged
 
 
 # Функция для получения профиля пациента
@@ -1448,7 +1641,7 @@ async def handle_document(message: types.Message, state: FSMContext):
                 if not profile:
                     patient_data = await extract_patient_data_from_text(pdf_text)
                     if patient_data and (
-                            patient_data.get("name") or patient_data.get("age") or patient_data.get("gender")):
+                            patient_data.get("name") or patient_data.get("age") or patient_data.get("gender") or patient_data.get("birth_date")):
                         extracted_info = "📝 Я обнаружил(а) в вашем анализе следующие данные:\n\n"
                         if patient_data.get("name"):
                             extracted_info += f"👤 Имя: {patient_data['name']}\n"
@@ -1456,6 +1649,8 @@ async def handle_document(message: types.Message, state: FSMContext):
                             extracted_info += f"🎂 Возраст: {patient_data['age']}\n"
                         if patient_data.get("gender"):
                             extracted_info += f"⚧️ Пол: {patient_data['gender']}\n"
+                        if patient_data.get("birth_date"):
+                            extracted_info += f"📅 Дата рождения: {patient_data['birth_date']}\n"
                         extracted_info += "\nСоздать профиль с этими данными?"
 
                         await message.answer(
@@ -1477,19 +1672,67 @@ async def handle_document(message: types.Message, state: FSMContext):
                             pdf_text=pdf_text
                         )
                         return
-
-                # Предлагаем проанализировать результаты
-                await message.answer(
-                    "🔍 Хотите, чтобы я проанализировал(а) ваши анализы?",
-                    reply_markup=InlineKeyboardBuilder().add(
-                        types.InlineKeyboardButton(
-                            text="✅ Да, проанализировать",
-                            callback_data="analyze_pdf"
+                else:
+                    # Если профиль уже есть, проверяем, есть ли новые данные для обновления
+                    patient_data = await extract_patient_data_from_text(pdf_text)
+                    updates_needed = {}
+                    update_info = ""
+                    
+                    # Проверяем, какие данные можно обновить
+                    if patient_data.get("name") and patient_data["name"] != profile.get("name"):
+                        updates_needed["name"] = patient_data["name"]
+                        update_info += f"👤 Имя: {profile.get('name')} → {patient_data['name']}\n"
+                        
+                    if patient_data.get("birth_date") and patient_data["birth_date"] != profile.get("birth_date"):
+                        updates_needed["birth_date"] = patient_data["birth_date"]
+                        update_info += f"📅 Дата рождения: {profile.get('birth_date', 'не указана')} → {patient_data['birth_date']}\n"
+                        
+                    if patient_data.get("age") and patient_data["age"] != profile.get("age"):
+                        updates_needed["age"] = patient_data["age"]
+                        update_info += f"🎂 Возраст: {profile.get('age', 'не указан')} → {patient_data['age']}\n"
+                        
+                    if patient_data.get("gender") and patient_data["gender"] != profile.get("gender"):
+                        updates_needed["gender"] = patient_data["gender"]
+                        update_info += f"⚧️ Пол: {profile.get('gender', 'не указан')} → {patient_data['gender']}\n"
+                    
+                    # Если есть обновления, предлагаем их применить
+                    if updates_needed:
+                        update_message = f"🔄 Обнаружены новые данные пациента:\n\n{update_info}\n\nОбновить профиль?"
+                        
+                        await message.answer(
+                            update_message,
+                            reply_markup=InlineKeyboardBuilder().add(
+                                types.InlineKeyboardButton(
+                                    text="✅ Да, обновить",
+                                    callback_data="update_profile_data"
+                                ),
+                                types.InlineKeyboardButton(
+                                    text="❌ Нет, оставить как есть",
+                                    callback_data="keep_existing_data"
+                                )
+                            ).as_markup()
                         )
-                    ).as_markup()
-                )
-                await state.set_state(DoctorStates.waiting_for_clarification)
-                await state.update_data(pdf_text=pdf_text)
+                        
+                        # Сохраняем данные для обновления в состоянии
+                        await state.set_state(DoctorStates.updating_profile)
+                        await state.update_data(
+                            profile_updates=updates_needed,
+                            pdf_text=pdf_text
+                        )
+                        return
+                    
+                    # Если обновлений нет, предлагаем проанализировать результаты
+                    await message.answer(
+                        "🔍 Хотите, чтобы я проанализировал(а) ваши анализы?",
+                        reply_markup=InlineKeyboardBuilder().add(
+                            types.InlineKeyboardButton(
+                                text="✅ Да, проанализировать",
+                                callback_data="analyze_pdf"
+                            )
+                        ).as_markup()
+                    )
+                    await state.set_state(DoctorStates.waiting_for_clarification)
+                    await state.update_data(pdf_text=pdf_text)
             else:
                 await processing_msg.edit_text("😔 Не удалось извлечь результаты анализов из PDF файла.")
         else:
@@ -1520,7 +1763,7 @@ async def handle_photo(message: types.Message, state: FSMContext):
     
     if not profile:
         # Если профиля нет, предлагаем создать его на основе извлеченных данных
-        if patient_data and (patient_data.get("name") or patient_data.get("age") or patient_data.get("gender")):
+        if patient_data and (patient_data.get("name") or patient_data.get("age") or patient_data.get("gender") or patient_data.get("birth_date")):
             extracted_info = "📝 Я обнаружил(а) в вашем анализе следующие данные:\n\n"
             if patient_data.get("name"):
                 extracted_info += f"👤 Имя: {patient_data['name']}\n"
@@ -1528,6 +1771,8 @@ async def handle_photo(message: types.Message, state: FSMContext):
                 extracted_info += f"🎂 Возраст: {patient_data['age']}\n"
             if patient_data.get("gender"):
                 extracted_info += f"⚧️ Пол: {patient_data['gender']}\n"
+            if patient_data.get("birth_date"):
+                extracted_info += f"📅 Дата рождения: {patient_data['birth_date']}\n"
             
             extracted_info += "\nИспользовать эти данные для создания вашего профиля?"
             
@@ -1569,20 +1814,67 @@ async def handle_photo(message: types.Message, state: FSMContext):
                 source="Изображение из Telegram"
             )
     else:
-        # Если профиль уже есть, сначала сохраняем в медицинские записи
+        # Если профиль уже есть, проверяем, есть ли новые данные для обновления
+        updates_needed = {}
+        update_info = ""
+        
+        # Проверяем, какие данные можно обновить
+        if patient_data.get("name") and patient_data["name"] != profile.get("name"):
+            updates_needed["name"] = patient_data["name"]
+            update_info += f"👤 Имя: {profile.get('name')} → {patient_data['name']}\n"
+            
+        if patient_data.get("birth_date") and patient_data["birth_date"] != profile.get("birth_date"):
+            updates_needed["birth_date"] = patient_data["birth_date"]
+            update_info += f"📅 Дата рождения: {profile.get('birth_date', 'не указана')} → {patient_data['birth_date']}\n"
+            
+        if patient_data.get("age") and patient_data["age"] != profile.get("age"):
+            updates_needed["age"] = patient_data["age"]
+            update_info += f"🎂 Возраст: {profile.get('age', 'не указан')} → {patient_data['age']}\n"
+            
+        if patient_data.get("gender") and patient_data["gender"] != profile.get("gender"):
+            updates_needed["gender"] = patient_data["gender"]
+            update_info += f"⚧️ Пол: {profile.get('gender', 'не указан')} → {patient_data['gender']}\n"
+        
+        # Если есть обновления, предлагаем их применить
+        if updates_needed:
+            update_message = f"🔄 Обнаружены новые данные пациента:\n\n{update_info}\n\nОбновить профиль?"
+            
+            await message.answer(
+                update_message,
+                reply_markup=InlineKeyboardBuilder().add(
+                    types.InlineKeyboardButton(
+                        text="✅ Да, обновить",
+                        callback_data="update_profile_data"
+                    ),
+                    types.InlineKeyboardButton(
+                        text="❌ Нет, оставить как есть",
+                        callback_data="keep_existing_data"
+                    )
+                ).as_markup()
+            )
+            
+            # Сохраняем данные для обновления в состоянии
+            await state.set_state(DoctorStates.updating_profile)
+            await state.update_data(
+                profile_updates=updates_needed,
+                analysis_result=analysis_result
+            )
+        else:
+            # Если обновлений нет, просто показываем результат анализа
+            await message.answer(
+                f"📊 <b>Результат анализа:</b>\n\n{escape_html(analysis_result)}\n\n"
+                f"ℹ️ Новых данных пациента не обнаружено.\n"
+                f"⚠️ Помните, что это автоматический анализ, и он не заменяет консультацию специалиста.",
+                parse_mode="HTML"
+            )
+        
+        # В любом случае сохраняем в медицинские записи
         save_medical_record(
             user_id=generate_user_uuid(message.from_user.id),
             record_type="image_analysis",
             content=analysis_result,
             source="Изображение из Telegram"
         )
-        
-        # Затем показываем результат анализа
-        await message.answer(
-            f"📊 <b>Результат анализа:</b>\n\n{escape_html(analysis_result)}\n\n"
-            f"⚠️ Помните, что это автоматический анализ, и он не заменяет консультацию специалиста.",
-            parse_mode="HTML"
-            )
 
 
 # Основной обработчик сообщений
@@ -1626,13 +1918,52 @@ async def handle_message(message: types.Message, state: FSMContext):
         return
     
     # Если информации достаточно, продолжаем стандартную обработку
+    
+    # Специальная обработка для запросов о конкретных результатах анализов
+    specific_test_keywords = ['anti-hev', 'anti-hev igg', 'anti-hbv', 'anti-hcv', 'ige', 'opisthorchis', 'toxocara', 'lamblia', 'ascaris']
+    is_specific_test_query = any(keyword in question.lower() for keyword in specific_test_keywords)
+    
+    if is_specific_test_query and not has_medical_records:
+        # Если спрашивают о конкретных результатах, но нет медицинских записей
+        await message.answer(
+            "❌ У вас пока нет загруженных результатов анализов. "
+            "Пожалуйста, сначала загрузите изображение или PDF файл с результатами анализов, "
+            "а затем я смогу ответить на ваш вопрос о конкретных показателях."
+        )
+        return
+    
     processing_msg = await message.answer("🔍 Ищу информацию по вашему вопросу...")
     
     # Проверяем, есть ли в вопросе запрос на анализ анализов
     analysis_keywords = ['анализ', 'анализы', 'результат', 'показатель', 'кровь', 'моча', 'биохимия', 'общий анализ']
     test_context = ""
-    if any(keyword in question.lower() for keyword in analysis_keywords):
-        # Получаем сводку по анализам от агента
+    
+    # Проверяем, есть ли медицинские записи и запрос на конкретные результаты
+    if has_medical_records:
+        # Получаем все медицинские записи пользователя
+        medical_records = get_medical_records(generate_user_uuid(user_id))
+        
+        # Проверяем, спрашивает ли пользователь о конкретных результатах анализов
+        specific_test_keywords = ['anti-hev', 'anti-hev igg', 'anti-hbv', 'anti-hcv', 'ige', 'opisthorchis', 'toxocara', 'lamblia', 'ascaris']
+        is_specific_test_query = any(keyword in question.lower() for keyword in specific_test_keywords)
+        
+        if is_specific_test_query:
+            # Формируем контекст с конкретными результатами анализов
+            test_context = "\n\n📊 ВАШИ РЕЗУЛЬТАТЫ АНАЛИЗОВ:\n"
+            for record in medical_records:
+                if record.get('record_type') in ['analysis', 'image_analysis']:
+                    content = record.get('content', '')
+                    # Очищаем и форматируем контент для лучшего понимания ИИ
+                    cleaned_content = content.replace('\n\n', '\n').strip()
+                    test_context += f"\n{cleaned_content}\n"
+                    break  # Берем первую запись с результатами анализов
+        else:
+            # Получаем сводку по анализам от агента для общих вопросов
+            test_summary = await test_agent.get_test_summary(generate_user_uuid(user_id))
+            if test_summary:
+                test_context = f"\n\n📊 {test_summary}"
+    elif any(keyword in question.lower() for keyword in analysis_keywords):
+        # Если нет медицинских записей, но есть общий запрос на анализы
         test_summary = await test_agent.get_test_summary(generate_user_uuid(user_id))
         if test_summary:
             test_context = f"\n\n📊 {test_summary}"
@@ -1642,12 +1973,22 @@ async def handle_message(message: types.Message, state: FSMContext):
         system_prompt = """Ты — ИИ-врач главный, опытный медицинский специалист с глубокими знаниями в медицине. 
         Твоя задача — давать профессиональные медицинские консультации, анализировать результаты анализов, 
         интерпретировать медицинские данные и предоставлять квалифицированные рекомендации. 
-        Используй всю доступную информацию о пациенте, историю диалога и медицинские записи для точной диагностики и консультации."""
+        Используй всю доступную информацию о пациенте, историю диалога и медицинские записи для точной диагностики и консультации.
+        
+        ВАЖНО: Если в контексте есть результаты анализов пациента, всегда используй их для ответа на вопросы.
+        Если спрашивают о конкретном показателе (например, anti-HEV IgG), найди этот показатель в результатах и дай подробный ответ.
+        Всегда указывай конкретные значения, референсные диапазоны и интерпретацию результатов.
+        
+        ИНСТРУКЦИЯ: Когда пользователь спрашивает о конкретном показателе, сначала найди его в результатах анализов, 
+        затем дай подробный ответ с указанием значения, референсного диапазона и медицинской интерпретации."""
         mode_indicator = "👨‍⚕️ ИИ-врач главный"
     else:
         system_prompt = """Ты — ИИ-ассистент врача, который помогает собрать информацию и подготовить данные для консультации. 
         Твоя задача — помогать пользователям с медицинскими вопросами, анализировать их анализы и предоставлять информацию о здоровье. 
-        Отвечай максимально точно и информативно, используя предоставленный контекст."""
+        Отвечай максимально точно и информативно, используя предоставленный контекст.
+        
+        ВАЖНО: Если в контексте есть результаты анализов пациента, всегда используй их для ответа на вопросы.
+        Если спрашивают о конкретном показателе, найди этот показатель в результатах и дай подробный ответ."""
         mode_indicator = "👩‍⚕️ ИИ-ассистент врача"
     
     # 1. Сначала ищем в авторитетных медицинских источниках
@@ -1790,15 +2131,17 @@ async def handle_profile_creation_callback(callback: types.CallbackQuery, state:
         name = patient_data.get("name", "аноним")
         age = patient_data.get("age")
         gender = patient_data.get("gender")
+        birth_date = patient_data.get("birth_date")
         
         # Создаем профиль
-        if create_patient_profile(generate_user_uuid(callback.from_user.id), name, age, gender, callback.from_user.id):
+        if create_patient_profile(generate_user_uuid(callback.from_user.id), name, age, gender, callback.from_user.id, birth_date):
             await callback.message.edit_text(
                 f"✅ Профиль успешно создан!\n\n"
                 f"👤 <b>Ваш профиль:</b>\n"
                 f"📝 Имя: {name}\n"
                 f"🎂 Возраст: {age if age else 'не указан'}\n"
-                f"⚧️ Пол: {gender if gender else 'не указан'}\n\n"
+                f"⚧️ Пол: {gender if gender else 'не указан'}\n"
+                f"📅 Дата рождения: {birth_date if birth_date else 'не указана'}\n\n"
                 f"📊 <b>Результат анализа:</b>\n\n{escape_html(analysis_result)}\n\n"
                 f"⚠️ Помните, что это автоматический анализ, и он не заменяет консультацию специалиста.",
                 parse_mode="HTML"
@@ -1817,6 +2160,56 @@ async def handle_profile_creation_callback(callback: types.CallbackQuery, state:
     
     await state.clear()
 
+
+# Обработчик обновления профиля пациента
+@dp.callback_query(F.data.in_(["update_profile_data", "keep_existing_data"]))
+async def handle_profile_update_callback(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    profile_updates = data.get("profile_updates", {})
+    analysis_result = data.get("analysis_result", "")
+    pdf_text = data.get("pdf_text", "")
+    
+    # Определяем тип контента для отображения
+    content_text = analysis_result if analysis_result else pdf_text[:500] + "..." if pdf_text else "обработанный документ"
+    
+    if callback.data == "update_profile_data":
+        # Обновляем профиль
+        user_id = generate_user_uuid(callback.from_user.id)
+        if update_patient_profile(user_id, **profile_updates):
+            # Получаем обновленный профиль для отображения
+            updated_profile = get_patient_profile(user_id)
+            
+            update_summary = "✅ Профиль успешно обновлен!\n\n"
+            update_summary += "👤 <b>Обновленные данные:</b>\n"
+            
+            for field, value in profile_updates.items():
+                if field == "name":
+                    update_summary += f"📝 Имя: {value}\n"
+                elif field == "age":
+                    update_summary += f"🎂 Возраст: {value}\n"
+                elif field == "gender":
+                    update_summary += f"⚧️ Пол: {value}\n"
+                elif field == "birth_date":
+                    update_summary += f"📅 Дата рождения: {value}\n"
+            
+            update_summary += f"\n📊 <b>Результат обработки:</b>\n\n{escape_html(content_text)}\n\n"
+            update_summary += "⚠️ Помните, что это автоматический анализ, и он не заменяет консультацию специалиста."
+            
+            await callback.message.edit_text(update_summary, parse_mode="HTML")
+        else:
+            await callback.message.edit_text("😔 Не удалось обновить профиль. Пожалуйста, попробуйте еще раз.")
+    else:
+        # Оставляем существующие данные
+        await callback.message.edit_text(
+            f"ℹ️ Профиль оставлен без изменений.\n\n"
+            f"📊 <b>Результат обработки:</b>\n\n{escape_html(content_text)}\n\n"
+            f"⚠️ Помните, что это автоматический анализ, и он не заменяет консультацию специалиста.",
+            parse_mode="HTML"
+        )
+    
+    await state.clear()
+
+
 # Обработчик создания профиля на основе извлеченных данных из PDF
 @dp.callback_query(F.data.in_(["use_extracted_data_pdf", "create_anonymous_profile_pdf"]))
 async def handle_pdf_profile_creation_callback(callback: types.CallbackQuery, state: FSMContext):
@@ -1830,15 +2223,17 @@ async def handle_pdf_profile_creation_callback(callback: types.CallbackQuery, st
         name = patient_data.get("name", "аноним")
         age = patient_data.get("age")
         gender = patient_data.get("gender")
+        birth_date = patient_data.get("birth_date")
         
         # Создаем профиль
-        if create_patient_profile(generate_user_uuid(callback.from_user.id), name, age, gender, callback.from_user.id):
+        if create_patient_profile(generate_user_uuid(callback.from_user.id), name, age, gender, callback.from_user.id, birth_date):
             await callback.message.edit_text(
                 f"✅ Профиль успешно создан!\n\n"
                 f"👤 <b>Ваш профиль:</b>\n"
                 f"📝 Имя: {name}\n"
                 f"🎂 Возраст: {age if age else 'не указан'}\n"
-                f"⚧️ Пол: {gender if gender else 'не указан'}\n\n"
+                f"⚧️ Пол: {gender if gender else 'не указан'}\n"
+                f"📅 Дата рождения: {birth_date if birth_date else 'не указана'}\n\n"
                 "🔍 Хотите, чтобы я проанализировал(а) ваши анализы?",
                 reply_markup=InlineKeyboardBuilder().add(
                     types.InlineKeyboardButton(
@@ -1868,314 +2263,6 @@ async def handle_pdf_profile_creation_callback(callback: types.CallbackQuery, st
         # Сохраняем данные для анализа
         await state.set_state(DoctorStates.waiting_for_clarification)
         await state.update_data(pdf_text=pdf_text)
-
-
-# Обработчик кнопок уточнения
-@dp.callback_query(F.data.in_(
-    ["clarify_question", "upload_tests", "try_again", "analyze_pdf", "create_extracted_profile", "manual_profile"]))
-async def handle_clarification_callback(callback: types.CallbackQuery, state: FSMContext):
-    if callback.data == "clarify_question":
-        await callback.message.edit_text(
-            "🔄 Пожалуйста, уточните ваш вопрос или опишите симптомы более подробно."
-        )
-        await state.set_state(DoctorStates.waiting_for_clarification)
-    elif callback.data == "upload_tests":
-        await callback.message.edit_text(
-            "📊 Пожалуйста, загрузите PDF файл с вашими анализами или отправьте фото медицинского документа."
-        )
-        await state.set_state(DoctorStates.waiting_for_file)
-    elif callback.data == "try_again":
-        data = await state.get_data()
-        question = data["question"]
-        history = data.get("history", [])
-        profile = get_patient_profile(generate_user_uuid(callback.from_user.id))
-
-        await callback.message.edit_text("🔄 Пробую найти другой ответ...")
-        web_context = await search_web(f"{question} медицина здоровье лечение")
-        new_answer, new_provider, new_metadata = await generate_answer_with_failover(question, web_context, history,
-                                                                                      profile, generate_user_uuid(callback.from_user.id))
-        history.append({"role": "assistant", "content": new_answer})
-        await state.update_data(history=history)
-        await callback.message.edit_text(
-            f"{escape_html(new_answer)}\n\n📖 <b>Источник:</b> дополнительный поиск в интернете",
-            parse_mode="HTML",
-            reply_markup=get_feedback_keyboard()
-        )
-        await state.update_data(
-            answer=new_answer,
-            provider=new_provider,
-            metadata=new_metadata,
-            source="интернета"
-        )
-        await state.set_state(DoctorStates.waiting_for_feedback)
-    elif callback.data == "analyze_pdf":
-        data = await state.get_data()
-        pdf_text = data.get("pdf_text", "")
-        if pdf_text:
-            await callback.message.edit_text("📊 Анализирую результаты анализов...")
-            profile = get_patient_profile(generate_user_uuid(callback.from_user.id))
-
-            # Используем агента для анализа
-            analysis_result = await test_agent.get_test_summary(generate_user_uuid(callback.from_user.id))
-            if analysis_result:
-                save_medical_record(
-                    user_id=generate_user_uuid(callback.from_user.id),
-                    record_type="analysis_result",
-                    content=analysis_result,
-                    source="Анализ PDF файла"
-                )
-                await callback.message.edit_text(
-                    f"📊 <b>Результат анализа:</b>\n\n{escape_html(analysis_result)}\n\n"
-                    f"⚠️ Помните, что это автоматический анализ, и он не заменяет консультацию специалиста.",
-                    parse_mode="HTML",
-                    reply_markup=get_main_keyboard()
-                )
-                await state.clear()
-            else:
-                await callback.message.edit_text(
-                    "😔 Не удалось проанализировать результаты анализов. Пожалуйста, попробуйте еще раз."
-                )
-        else:
-            await callback.message.edit_text(
-                "😔 Не удалось найти данные для анализа. Пожалуйста, загрузите PDF файл с анализами снова."
-            )
-            await state.set_state(DoctorStates.waiting_for_file)
-    elif callback.data == "create_extracted_profile":
-        data = await state.get_data()
-        patient_data = data.get("extracted_patient_data", {})
-        if patient_data and (patient_data.get("name") or patient_data.get("age") or patient_data.get("gender")):
-            missing_data = []
-            if not patient_data.get("name"):
-                missing_data.append("имя")
-            if not patient_data.get("age"):
-                missing_data.append("возраст")
-            if not patient_data.get("gender"):
-                missing_data.append("пол")
-
-            if missing_data:
-                await callback.message.edit_text(
-                    f"📝 Для создания профиля не хватает следующих данных: {', '.join(missing_data)}.\n\n"
-                    f"Пожалуйста, отправьте недостающую информацию в формате:\n"
-                    f"<b>Имя: [ваше имя]</b>\n"
-                    f"<b>Возраст: [ваш возраст]</b>\n"
-                    f"<b>Пол: [М/Ж]</b>",
-                    parse_mode="HTML"
-                )
-                await state.set_state(DoctorStates.waiting_for_patient_id)
-                await state.update_data(extracted_patient_data=patient_data)
-            else:
-                if create_patient_profile(generate_user_uuid(callback.from_user.id), patient_data['name'], patient_data['age'],
-                                          patient_data['gender'], callback.from_user.id):
-                    await callback.message.edit_text(
-                        f"✅ Профиль успешно создан!\n\n"
-                        f"👤 <b>Ваш профиль:</b>\n"
-                        f"📝 Имя: {patient_data['name']}\n"
-                        f"🎂 Возраст: {patient_data['age']}\n"
-                        f"⚧️ Пол: {'Мужской' if patient_data['gender'] == 'М' else 'Женский'}\n\n"
-                        f"Теперь вы можете задавать медицинские вопросы и загружать анализы.",
-                        parse_mode="HTML",
-                        reply_markup=get_main_keyboard()
-                    )
-
-                    pdf_text = data.get("pdf_text", "")
-                    if pdf_text:
-                        await bot.send_message(
-                            callback.message.chat.id,
-                            "🔍 Хотите, чтобы я проанализировал(а) ваши анализы?",
-                            reply_markup=InlineKeyboardBuilder().add(
-                                types.InlineKeyboardButton(
-                                    text="✅ Да, проанализировать",
-                                    callback_data="analyze_pdf"
-                                )
-                            ).as_markup()
-                        )
-                        await state.set_state(DoctorStates.waiting_for_clarification)
-                        await state.update_data(pdf_text=pdf_text)
-
-                    await state.clear()
-                else:
-                    await callback.message.edit_text(
-                        "😔 Не удалось создать профиль. Пожалуйста, попробуйте ввести данные вручную с помощью команды /profile.")
-        else:
-            await callback.message.edit_text(
-                "😔 Не удалось извлечь данные пациента. Пожалуйста, создайте профиль вручную с помощью команды /profile.")
-    elif callback.data == "manual_profile":
-        await callback.message.edit_text(
-            "📝 Для создания профиля пациента, пожалуйста, предоставьте следующую информацию:\n\n"
-            "1. Ваше имя\n"
-            "2. Возраст\n"
-            "3. Пол (М/Ж)\n\n"
-            "Пожалуйста, отправьте информацию в формате:\n"
-            "<b>Имя: [ваше имя]</b>\n"
-            "<b>Возраст: [ваш возраст]</b>\n"
-            "<b>Пол: [М/Ж]</b>",
-            parse_mode="HTML"
-        )
-        await state.set_state(DoctorStates.waiting_for_patient_id)
-
-
-# Обработчик кнопок главного меню
-@dp.callback_query(F.data.in_(["my_tests", "my_history", "create_profile"]))
-async def handle_main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
-    user_id = str(callback.from_user.id)
-
-    if callback.data == "my_tests":
-        tests = get_patient_tests(user_id)
-        if tests:
-            tests_text = "📊 <b>Ваши анализы:</b>\n\n"
-            for test in tests[:10]:
-                status = "⚠️" if test.get('is_abnormal') else "✅"
-                tests_text += f"{status} {test['test_name']}: {test['value']} {test['unit'] or ''} (норма: {test['reference_range'] or 'не указана'}) от {test['test_date'] or 'дата не указана'}\n"
-                if test.get('notes'):
-                    tests_text += f"   💬 {test['notes']}\n"
-                tests_text += "\n"
-            await callback.message.edit_text(
-                tests_text,
-                parse_mode="HTML",
-                reply_markup=get_main_keyboard()
-            )
-        else:
-            await callback.message.edit_text(
-                "📊 У вас пока нет загруженных анализов.\n\n"
-                "Вы можете загрузить PDF файл с анализами или отправить фото медицинского документа.",
-                reply_markup=get_main_keyboard()
-            )
-    elif callback.data == "my_history":
-        records = get_medical_records(user_id)
-        if records:
-            history_text = "📝 <b>Ваша медицинская история:</b>\n\n"
-            for record in records[:5]:
-                record_type = record.get("record_type", "запись")
-                history_text += f"📅 {record['created_at'][:10]} ({record_type}): {record['content'][:100]}...\n\n"
-            await callback.message.edit_text(
-                history_text,
-                parse_mode="HTML",
-                reply_markup=get_main_keyboard()
-            )
-        else:
-            await callback.message.edit_text(
-                "📝 У вас пока нет медицинской истории.\n\n"
-                "Она будет формироваться по мере ваших обращений и загрузки анализов.",
-                reply_markup=get_main_keyboard()
-            )
-    elif callback.data == "create_profile":
-        profile = get_patient_profile(user_id)
-        if profile:
-            await callback.message.edit_text(
-                f"👤 <b>Ваш профиль:</b>\n\n"
-                f"🆔 ID: {profile['id']}\n"
-                f"📝 Имя: {profile['name']}\n"
-                f"🎂 Возраст: {profile['age']}\n"
-                f"⚧️ Пол: {profile['gender']}\n"
-                f"📅 Создан: {profile['created_at'][:10]}",
-                parse_mode="HTML",
-                reply_markup=get_main_keyboard()
-            )
-        else:
-            await callback.message.edit_text(
-                "📝 Для создания профиля пациента, пожалуйста, предоставьте следующую информацию:\n\n"
-                "1. Ваше имя\n"
-                "2. Возраст\n"
-                "3. Пол (М/Ж)\n\n"
-                "Пожалуйста, отправьте информацию в формате:\n"
-                "<b>Имя: [ваше имя]</b>\n"
-                "<b>Возраст: [ваш возраст]</b>\n"
-                "<b>Пол: [М/Ж]</b>",
-                parse_mode="HTML"
-            )
-            await state.set_state(DoctorStates.waiting_for_patient_id)
-
-
-# Обработчик уточненного вопроса
-@dp.message(DoctorStates.waiting_for_clarification)
-async def handle_clarification(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    data = await state.get_data()
-    
-    # Получаем сохраненные данные
-    original_question = data.get("original_question", "")
-    history = data.get("history", [])
-    clarification_count = data.get("clarification_count", 0)
-    profile = get_patient_profile(generate_user_uuid(user_id))
-    
-    # Добавляем ответ пользователя в историю
-    history.append({"role": "user", "content": message.text})
-    
-    # Проверяем, нужно ли еще уточнять информацию
-    is_enough, clarification_question = await clarification_agent.analyzeAnd_ask(
-        original_question, history, profile, clarification_count
-    )
-    
-    # Если нужно еще уточнить
-    if not is_enough and clarification_question:
-        await message.answer(clarification_question)
-        await state.update_data(
-            clarification_count=clarification_count + 1,
-            history=history
-        )
-        return
-    
-    # Если информации достаточно или достигнут лимит уточнений
-    processing_msg = await message.answer("🔍 Ищу информацию по вашему вопросу...")
-    
-    # Проверяем, есть ли в вопросе запрос на анализ анализов
-    analysis_keywords = ['анализ', 'анализы', 'результат', 'показатель', 'кровь', 'моча', 'биохимия', 'общий анализ']
-    test_context = ""
-    if any(keyword in original_question.lower() for keyword in analysis_keywords):
-        # Получаем сводку по анализам от агента
-        test_summary = await test_agent.get_test_summary(generate_user_uuid(user_id))
-        if test_summary:
-            test_context = f"\n\n📊 {test_summary}"
-    
-    # 1. Сначала ищем в авторитетных медицинских источниках
-    medical_context = await search_medical_sources(original_question)
-    if medical_context:
-        await processing_msg.edit_text("📚 Найдено в медицинских источниках. Генерирую ответ...")
-        answer, provider, metadata = await generate_answer_with_failover(
-            original_question, medical_context + test_context, history, profile, str(user_id)
-        )
-        source = "авторитетных медицинских источников"
-    else:
-        # 2. Если не нашли в медицинских источниках, ищем в своей базе знаний
-        await processing_msg.edit_text("🗂️ Ищу в накопленной базе знаний...")
-        kb_context = search_knowledge_base(original_question)
-        if kb_context:
-            await processing_msg.edit_text("💡 Найдено в базе знаний. Генерирую ответ...")
-            answer, provider, metadata = await generate_answer_with_failover(
-                original_question, kb_context + test_context, history, profile, str(user_id)
-            )
-            source = "накопленной базы знаний"
-        else:
-            # 3. Если нигде не нашли, ищем в интернете
-            await processing_msg.edit_text("🌐 Ищу дополнительную информацию в интернете...")
-            web_context = await search_web(f"{original_question} медицина здоровье")
-            answer, provider, metadata = await generate_answer_with_failover(
-                original_question, web_context + test_context, history, profile, str(user_id)
-            )
-            source = "интернета"
-    
-    await processing_msg.delete()
-    history.append({"role": "assistant", "content": answer})
-    await message.answer(f"{escape_html(answer)}\n\n📖 <b>Источник:</b> {escape_html(source)}", parse_mode="HTML")
-    await message.answer("❓ Помог ли вам мой ответ?", reply_markup=get_feedback_keyboard())
-    await state.set_state(DoctorStates.waiting_for_feedback)
-    await state.update_data(
-        question=original_question,
-        answer=answer,
-        source=source,
-        provider=provider,
-        metadata=metadata,
-        attempts=0,
-        user_id=str(user_id),
-        history=history
-    )
-    scheduler.add_job(
-        send_reminder,
-        "date",
-        run_date=datetime.now() + timedelta(hours=1),
-        args=[message.chat.id],
-        id=f"reminder_{message.chat.id}"
-    )
 
 
 # Обработчик загрузки файла в состоянии ожидания
