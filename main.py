@@ -94,7 +94,9 @@ MODEL_CONFIG = {
         "api_key": os.getenv("CEREBRAS_API_KEY"),
         "base_url": "https://api.cerebras.ai/v1",
         "models": [
-            {"name": "qwen-3-235b-thinking", "priority": 1, "type": "text"}
+            {"name": "qwen-3-235b-a22b-thinking-2507", "priority": 1, "type": "text"},
+            {"name": "qwen-3-235b-a22b-thinking", "priority": 2, "type": "text"},
+            {"name": "qwen-3-235b", "priority": 3, "type": "text"}
         ],
         "client": None  # Будет инициализирован позже
     }
@@ -296,6 +298,12 @@ async def call_model_with_failover(
         try:
             logging.info(f"Пробую модель {model_name} от провайдера {provider}")
             
+            # Дополнительная диагностика для Cerebras
+            if provider == "cerebras":
+                logging.info(f"Cerebras API Key: {config.get('api_key', '')[:10]}...")
+                logging.info(f"Cerebras Base URL: {config.get('base_url', '')}")
+                logging.info(f"Client initialized: {config.get('client') is not None}")
+            
             # Добавляем системный промпт, если он указан
             if system_prompt:
                 # Проверяем, есть ли уже системный промпт в сообщениях
@@ -312,9 +320,19 @@ async def call_model_with_failover(
                 }
             
             # Выполняем запрос
+            # Для Qwen 3 235B Thinking модели добавляем специальные параметры
+            extra_params = {}
+            if provider == "cerebras" and "qwen-3-235b" in model_name:
+                extra_params = {
+                    "max_completion_tokens": 64000,  # Рекомендуется для предотвращения обрезки
+                    "temperature": 0.7,
+                    "top_p": 0.9
+                }
+            
             completion = client.chat.completions.create(
                 model=model_name,
                 messages=messages,
+                **extra_params,
                 **({"extra_headers": extra_headers} if extra_headers else {})
             )
             
@@ -325,6 +343,8 @@ async def call_model_with_failover(
             thinking_process = ""
             if provider == "cerebras" and hasattr(completion.choices[0], 'thinking'):
                 thinking_process = completion.choices[0].thinking
+            elif provider == "cerebras" and hasattr(completion.choices[0].message, 'thinking'):
+                thinking_process = completion.choices[0].message.thinking
             
             # Обновляем счетчик токенов (если есть информация)
             if hasattr(completion, 'usage') and completion.usage:
@@ -344,7 +364,25 @@ async def call_model_with_failover(
             return current_answer, provider, metadata
         except Exception as e:
             last_error = e
-            logging.warning(f"Ошибка при использовании модели {model_name} от провайдера {provider}: {e}")
+            error_msg = f"Ошибка при использовании модели {model_name} от провайдера {provider}: {e}"
+            
+            # Дополнительная диагностика для Cerebras
+            if provider == "cerebras":
+                error_msg += f"\nПроверьте:\n"
+                error_msg += f"- Правильность API ключа\n"
+                error_msg += f"- Доступность модели {model_name}\n"
+                error_msg += f"- Лимиты токенов\n"
+                error_msg += f"- Статус API Cerebras"
+                
+                # Проверяем конкретные ошибки Cerebras
+                if "model_not_found" in str(e):
+                    error_msg += f"\n❌ Модель {model_name} не найдена. Проверьте правильность названия."
+                elif "authentication" in str(e).lower():
+                    error_msg += f"\n❌ Ошибка аутентификации. Проверьте API ключ."
+                elif "rate_limit" in str(e).lower():
+                    error_msg += f"\n❌ Превышен лимит запросов."
+            
+            logging.warning(error_msg)
             continue
     
     # Если все модели не сработали
