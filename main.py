@@ -1063,12 +1063,12 @@ async def handle_document(message: types.Message, state: FSMContext):
                             extracted_info,
                             reply_markup=InlineKeyboardBuilder().add(
                                 types.InlineKeyboardButton(
-                                    text="✅ Да, создать",
-                                    callback_data="create_extracted_profile"
+                                    text="✅ Да, использовать",
+                                    callback_data="use_extracted_data_pdf"
                                 ),
                                 types.InlineKeyboardButton(
-                                    text="❌ Нет, ввести вручную",
-                                    callback_data="manual_profile"
+                                    text="❌ Нет, создать анонимный профиль",
+                                    callback_data="create_anonymous_profile_pdf"
                                 )
                             ).as_markup()
                         )
@@ -1105,38 +1105,79 @@ async def handle_document(message: types.Message, state: FSMContext):
 # Обработчик изображений
 @dp.message(F.photo)
 async def handle_photo(message: types.Message, state: FSMContext):
-    profile = get_patient_profile(message.from_user.id)
-
-    if not profile:
-        await message.answer(
-            "😔 Для загрузки изображений необходимо создать профиль пациента.\n"
-            "Используйте команду /profile для создания профиля."
-        )
-        return
-
     file_id = message.photo[-1].file_id
     file_info = await bot.get_file(file_id)
     file_path = file_info.file_path
     file_url = f"https://api.telegram.org/file/bot{os.getenv('TELEGRAM_BOT_TOKEN')}/{file_path}"
-
     processing_msg = await message.answer("🔍 Анализирую изображение...")
-
-    analysis_result = await analyze_image(file_url, "Что показано на этом медицинском изображении? Опиши подробно.")
-
+    
+    # Анализируем изображение для извлечения текста
+    analysis_result = await analyze_image(file_url, "Извлеки все медицинские данные и информацию о пациенте с этого изображения. Верни текст с анализами и данными пациента.")
     await processing_msg.edit_text("✅ Изображение успешно проанализировано.")
-
+    
+    # Сохраняем в медицинские записи
     save_medical_record(
         user_id=message.from_user.id,
         record_type="image_analysis",
         content=analysis_result,
         source="Изображение из Telegram"
     )
-
-    await message.answer(
-        f"📊 <b>Результат анализа:</b>\n\n{analysis_result}\n\n"
-        f"⚠️ Помните, что это автоматический анализ, и он не заменяет консультацию специалиста.",
-        parse_mode="HTML"
-    )
+    
+    # Пытаемся извлечь данные пациента из анализа
+    patient_data = await extract_patient_data_from_text(analysis_result)
+    
+    # Проверяем, есть ли профиль у пользователя
+    profile = get_patient_profile(message.from_user.id)
+    
+    if not profile:
+        # Если профиля нет, предлагаем создать его на основе извлеченных данных
+        if patient_data and (patient_data.get("name") or patient_data.get("age") or patient_data.get("gender")):
+            extracted_info = "📝 Я обнаружил(а) в вашем анализе следующие данные:\n\n"
+            if patient_data.get("name"):
+                extracted_info += f"👤 Имя: {patient_data['name']}\n"
+            if patient_data.get("age"):
+                extracted_info += f"🎂 Возраст: {patient_data['age']}\n"
+            if patient_data.get("gender"):
+                extracted_info += f"⚧️ Пол: {patient_data['gender']}\n"
+            
+            extracted_info += "\nИспользовать эти данные для создания вашего профиля?"
+            
+            await message.answer(
+                extracted_info,
+                reply_markup=InlineKeyboardBuilder().add(
+                    types.InlineKeyboardButton(
+                        text="✅ Да, использовать",
+                        callback_data="use_extracted_data"
+                    ),
+                    types.InlineKeyboardButton(
+                        text="❌ Нет, создать анонимный профиль",
+                        callback_data="create_anonymous_profile"
+                    )
+                ).as_markup()
+            )
+            
+            # Сохраняем извлеченные данные и результат анализа в состоянии
+            await state.set_state(DoctorStates.confirming_profile)
+            await state.update_data(
+                extracted_patient_data=patient_data,
+                analysis_result=analysis_result
+            )
+        else:
+            # Если не удалось извлечь данные, создаем анонимный профиль
+            create_patient_profile(message.from_user.id, "аноним", None, None)
+            await message.answer(
+                "✅ Создан анонимный профиль.\n\n"
+                f"📊 <b>Результат анализа:</b>\n\n{analysis_result}\n\n"
+                f"⚠️ Помните, что это автоматический анализ, и он не заменяет консультацию специалиста.",
+                parse_mode="HTML"
+            )
+    else:
+        # Если профиль уже есть, просто показываем результат анализа
+        await message.answer(
+            f"📊 <b>Результат анализа:</b>\n\n{analysis_result}\n\n"
+            f"⚠️ Помните, что это автоматический анализ, и он не заменяет консультацию специалиста.",
+            parse_mode="HTML"
+        )
 
 
 # Основной обработчик сообщений
@@ -1294,6 +1335,98 @@ async def handle_feedback_callback(callback: types.CallbackQuery, state: FSMCont
             source="интернета (дополнительный поиск)",
             attempts=attempts + 1
         )
+
+
+# Обработчик создания профиля на основе извлеченных данных
+@dp.callback_query(F.data.in_(["use_extracted_data", "create_anonymous_profile"]))
+async def handle_profile_creation_callback(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    patient_data = data.get("extracted_patient_data", {})
+    analysis_result = data.get("analysis_result", "")
+    
+    if callback.data == "use_extracted_data":
+        # Используем извлеченные данные
+        name = patient_data.get("name", "аноним")
+        age = patient_data.get("age")
+        gender = patient_data.get("gender")
+        
+        # Создаем профиль
+        if create_patient_profile(callback.from_user.id, name, age, gender):
+            await callback.message.edit_text(
+                f"✅ Профиль успешно создан!\n\n"
+                f"👤 <b>Ваш профиль:</b>\n"
+                f"📝 Имя: {name}\n"
+                f"🎂 Возраст: {age if age else 'не указан'}\n"
+                f"⚧️ Пол: {gender if gender else 'не указан'}\n\n"
+                f"📊 <b>Результат анализа:</b>\n\n{analysis_result}\n\n"
+                f"⚠️ Помните, что это автоматический анализ, и он не заменяет консультацию специалиста.",
+                parse_mode="HTML"
+            )
+        else:
+            await callback.message.edit_text("😔 Не удалось создать профиль. Пожалуйста, попробуйте еще раз.")
+    else:
+        # Создаем анонимный профиль
+        create_patient_profile(callback.from_user.id, "аноним", None, None)
+        await callback.message.edit_text(
+            "✅ Создан анонимный профиль.\n\n"
+            f"📊 <b>Результат анализа:</b>\n\n{analysis_result}\n\n"
+            f"⚠️ Помните, что это автоматический анализ, и он не заменяет консультацию специалиста.",
+            parse_mode="HTML"
+        )
+    
+    await state.clear()
+
+# Обработчик создания профиля на основе извлеченных данных из PDF
+@dp.callback_query(F.data.in_(["use_extracted_data_pdf", "create_anonymous_profile_pdf"]))
+async def handle_pdf_profile_creation_callback(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    patient_data = data.get("extracted_patient_data", {})
+    pdf_text = data.get("pdf_text", "")
+    test_results = data.get("test_results", [])
+    
+    if callback.data == "use_extracted_data_pdf":
+        # Используем извлеченные данные
+        name = patient_data.get("name", "аноним")
+        age = patient_data.get("age")
+        gender = patient_data.get("gender")
+        
+        # Создаем профиль
+        if create_patient_profile(callback.from_user.id, name, age, gender):
+            await callback.message.edit_text(
+                f"✅ Профиль успешно создан!\n\n"
+                f"👤 <b>Ваш профиль:</b>\n"
+                f"📝 Имя: {name}\n"
+                f"🎂 Возраст: {age if age else 'не указан'}\n"
+                f"⚧️ Пол: {gender if gender else 'не указан'}\n\n"
+                "🔍 Хотите, чтобы я проанализировал(а) ваши анализы?",
+                reply_markup=InlineKeyboardBuilder().add(
+                    types.InlineKeyboardButton(
+                        text="✅ Да, проанализировать",
+                        callback_data="analyze_pdf"
+                    )
+                ).as_markup()
+            )
+            # Сохраняем данные для анализа
+            await state.set_state(DoctorStates.waiting_for_clarification)
+            await state.update_data(pdf_text=pdf_text)
+        else:
+            await callback.message.edit_text("😔 Не удалось создать профиль. Пожалуйста, попробуйте еще раз.")
+    else:
+        # Создаем анонимный профиль
+        create_patient_profile(callback.from_user.id, "аноним", None, None)
+        await callback.message.edit_text(
+            "✅ Создан анонимный профиль.\n\n"
+            "🔍 Хотите, чтобы я проанализировал(а) ваши анализы?",
+            reply_markup=InlineKeyboardBuilder().add(
+                types.InlineKeyboardButton(
+                    text="✅ Да, проанализировать",
+                    callback_data="analyze_pdf"
+                )
+            ).as_markup()
+        )
+        # Сохраняем данные для анализа
+        await state.set_state(DoctorStates.waiting_for_clarification)
+        await state.update_data(pdf_text=pdf_text)
 
 
 # Обработчик кнопок уточнения
