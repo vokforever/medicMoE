@@ -1,8 +1,7 @@
-import os
 import asyncio
 import logging
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional, Tuple
+from datetime import datetime
+from typing import List, Dict, Any, Tuple
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -14,24 +13,18 @@ from config import bot_token, supabase
 from models import call_model_with_failover
 from agents import ClarificationAgent, TestAnalysisAgent, IntelligentQueryAnalyzer
 from database import (
-    generate_user_uuid, create_patient_profile, update_patient_profile,
-    get_patient_profile, save_test_results, get_patient_tests,
-    get_medical_records, save_medical_record, save_to_knowledge_base,
-    save_user_feedback, get_user_successful_responses, save_successful_response
+    generate_user_uuid, create_patient_profile, get_patient_profile, save_medical_record, get_user_successful_responses
 )
 from utils import (
-    escape_html, escape_markdown, search_medical_sources, search_web, search_knowledge_base,
-    extract_patient_data_from_text, analyze_image, extract_text_from_pdf,
+    escape_html, escape_markdown, search_medical_sources, analyze_image, extract_text_from_pdf,
     check_duplicate_medical_record_ai_enhanced
 )
 from keyboards import (
-    get_feedback_keyboard, get_clarification_keyboard, get_main_keyboard,
-    get_profile_confirmation_keyboard, get_profile_update_keyboard,
-    get_pdf_analysis_keyboard, get_complete_data_keyboard, get_add_date_keyboard
+    get_feedback_keyboard, get_main_keyboard
 )
 
 # Импорт и инициализация агента для структурированных данных
-from structured_tests_agent import StructuredTestAgent
+from structured_tests_agent import TestExtractionAgent
 
 # Класс для управления сессиями
 class SessionManager:
@@ -477,7 +470,7 @@ class EnhancedRAGSystem:
 # Инициализация компонентов
 session_manager = SessionManager(supabase)
 enhanced_rag_system = EnhancedRAGSystem(session_manager, supabase)
-structured_test_agent = StructuredTestAgent(supabase)
+structured_test_agent = TestExtractionAgent(supabase)
 
 # Инициализация бота и диспетчера
 bot = Bot(token=bot_token)
@@ -637,13 +630,15 @@ async def start_command(message: types.Message, state: FSMContext):
             f"👋 Здравствуйте, {profile['name']}! Я ваш ИИ-ассистент врача.\n\n"
             f"📊 Я могу помочь вам с анализом анализов, ответить на медицинские вопросы и хранить ваш анамнез.\n\n"
             f"💡 Просто задайте ваш вопрос, или загрузите анализы для анализа.\n\n"
-            f"📊 Доступные команды:\n"
-            f"• /start - перезапуск бота\n"
-            f"• /help - справка по использованию\n"
-            f"• /profile - управление профилем пациента\n"
-            f"• /tests - загрузка и анализ анализов\n"
-            f"• /history - история диалогов\n"
-            f"• /cleanup_duplicates - очистка дублирующихся записей\n\n"
+                         f"📊 Доступные команды:\n"
+             f"• /start - перезапуск бота\n"
+             f"• /help - справка по использованию\n"
+             f"• /profile - управление профилем пациента\n"
+             f"• /tests - загрузка и анализ анализов\n"
+             f"• /history - история диалогов\n"
+             f"• /cleanup_duplicates - очистка дублирующихся записей\n"
+             f"• /cleanup_tests - очистка результатов анализов от лишних символов\n"
+             f"• /reprocess_tests - переобработка медицинских записей\n\n"
             f"🔍 Что вас интересует?",
             reply_markup=get_main_keyboard()
         )
@@ -653,12 +648,14 @@ async def start_command(message: types.Message, state: FSMContext):
             "👋 Здравствуйте! Я ваш ИИ-ассистент врача.\n\n"
             f"📊 Я могу помочь вам с анализом анализов, ответить на медицинские вопросы и хранить ваш анамнез.\n\n"
             f"💡 Для начала работы создайте профиль пациента или загрузите анализы для анализа.\n\n"
-            f"📊 Доступные команды:\n"
-            f"• /start - перезапуск бота\n"
-            f"• /help - справка по использованию\n"
-            f"• /profile - создание профиля пациента\n"
-            f"• /tests - загрузка и анализ анализов\n"
-            f"• /cleanup_duplicates - очистка дублирующихся записей\n\n"
+                         f"📊 Доступные команды:\n"
+             f"• /start - перезапуск бота\n"
+             f"• /help - справка по использованию\n"
+             f"• /profile - создание профиля пациента\n"
+             f"• /tests - загрузка и анализ анализов\n"
+             f"• /cleanup_duplicates - очистка дублирующихся записей\n"
+             f"• /cleanup_tests - очистка результатов анализов от лишних символов\n"
+             f"• /reprocess_tests - переобработка медицинских записей\n\n"
             f"🔍 Что вас интересует?",
             reply_markup=get_main_keyboard()
         )
@@ -788,6 +785,78 @@ async def cleanup_duplicates_command(message: types.Message):
     except Exception as e:
         logging.error(f"Ошибка при очистке дубликатов: {e}")
         await message.answer("😔 Не удалось очистить дубликаты")
+
+# Обработчик команды /cleanup_tests
+@dp.message(Command("cleanup_tests"))
+async def cleanup_tests_command(message: types.Message):
+    """Очищает результаты анализов от лишних символов форматирования"""
+    try:
+        user_id = generate_user_uuid(message.from_user.id)
+        
+        # Отправляем сообщение о начале очистки
+        processing_msg = await message.answer("🧹 Начинаю очистку результатов анализов... Пожалуйста, подождите.")
+        
+        # Импортируем агент для работы с анализами
+        from structured_tests_agent import TestExtractionAgent
+        agent = TestExtractionAgent(supabase)
+        
+        # Очищаем существующие результаты
+        cleanup_result = await agent.cleanup_existing_test_results(user_id)
+        
+        if cleanup_result.get("success"):
+            cleaned_count = cleanup_result.get("cleaned_count", 0)
+            if cleaned_count > 0:
+                await processing_msg.edit_text(
+                    f"✅ Очистка завершена!\n\n"
+                    f"🧹 Очищено {cleaned_count} результатов анализов от лишних символов.\n\n"
+                    f"Теперь ваши анализы будут отображаться корректно без лишних символов форматирования."
+                )
+            else:
+                await processing_msg.edit_text(
+                    "✅ Очистка завершена!\n\n"
+                    "Все ваши результаты анализов уже корректно отформатированы."
+                )
+        else:
+            await processing_msg.edit_text(
+                f"😔 Не удалось выполнить очистку: {cleanup_result.get('message', 'Неизвестная ошибка')}"
+            )
+            
+    except Exception as e:
+        logging.error(f"Ошибка при очистке результатов анализов: {e}")
+        await message.answer("😔 Не удалось очистить результаты анализов. Попробуйте позже.")
+
+# Обработчик команды /reprocess_tests
+@dp.message(Command("reprocess_tests"))
+async def reprocess_tests_command(message: types.Message):
+    """Переобрабатывает медицинские записи для улучшения структурированных данных"""
+    try:
+        user_id = generate_user_uuid(message.from_user.id)
+        
+        # Отправляем сообщение о начале переобработки
+        processing_msg = await message.answer("🔄 Начинаю переобработку медицинских записей... Это может занять некоторое время.")
+        
+        # Импортируем агент для работы с анализами
+        from structured_tests_agent import TestExtractionAgent
+        agent = TestExtractionAgent(supabase)
+        
+        # Переобрабатываем записи
+        reprocess_result = await agent.reprocess_medical_records(user_id)
+        
+        if reprocess_result.get("success"):
+            tests_count = reprocess_result.get("tests_count", 0)
+            await processing_msg.edit_text(
+                f"✅ Переобработка завершена!\n\n"
+                f"🔄 Переобработано {tests_count} анализов с улучшенной логикой.\n\n"
+                f"Теперь ваши анализы будут корректно структурированы и очищены от лишних символов."
+            )
+        else:
+            await processing_msg.edit_text(
+                f"😔 Не удалось выполнить переобработку: {reprocess_result.get('message', 'Неизвестная ошибка')}"
+            )
+            
+    except Exception as e:
+        logging.error(f"Ошибка при переобработке анализов: {e}")
+        await message.answer("😔 Не удалось переобработать анализы. Попробуйте позже.")
 
 # Обработчик текстовых сообщений
 @dp.message(F.text)

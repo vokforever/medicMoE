@@ -697,7 +697,15 @@ async def is_duplicate_by_ai(new_content: str, existing_content: str) -> bool:
             model_type="text"
         )
         
-        if analysis_result:
+        if analysis_result and isinstance(analysis_result, tuple):
+            # call_model_with_failover возвращает (response, provider, metadata)
+            response_text = analysis_result[0]
+            if response_text:
+                is_duplicate = "ДА" in response_text.upper()
+                logging.info(f"ИИ определил дубликат: {is_duplicate} (ответ: {response_text})")
+                return is_duplicate
+        elif analysis_result and isinstance(analysis_result, str):
+            # Fallback для случая, если возвращается только строка
             is_duplicate = "ДА" in analysis_result.upper()
             logging.info(f"ИИ определил дубликат: {is_duplicate} (ответ: {analysis_result})")
             return is_duplicate

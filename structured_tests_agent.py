@@ -175,14 +175,8 @@ class TestExtractionAgent:
                     # Определяем референсные значения
                     reference_values = self._extract_reference_values(result)
                     
-                    # Очищаем результат
-                    clean_result = self._clean_result(result)
-                    
-                    # Если результат содержит только звездочки, ищем реальное значение в контексте
-                    if clean_result == "Не указан" and ("**" in result or "*" in result):
-                        real_result = self._extract_real_value_from_context(all_lines, line_index, "result")
-                        if real_result:
-                            clean_result = real_result
+                    # Очищаем результат с улучшенной логикой
+                    clean_result = self._clean_result_enhanced(result, all_lines, line_index)
                     
                     # Ищем дополнительную информацию в соседних строках
                     test_system = self._find_test_system(all_lines, line_index)
@@ -237,7 +231,7 @@ class TestExtractionAgent:
                     # Определяем референсные значения
                     reference_values = self._extract_reference_values(result)
                     
-                    # Очищаем результат
+                    # Очищаем результат с улучшенной логикой (используем простую версию для обратной совместимости)
                     clean_result = self._clean_result(result)
                     
                     if test_name and clean_result:
@@ -308,6 +302,77 @@ class TestExtractionAgent:
             clean_result = "Не указан"
         
         return clean_result
+    
+    def _clean_result_enhanced(self, result: str, all_lines: List[str], line_index: int) -> str:
+        """Улучшенная очистка результата с поиском в контексте"""
+        if not result:
+            return "Не указан"
+        
+        # Сначала пробуем обычную очистку
+        clean_result = self._clean_result(result)
+        
+        # Если результат содержит только звездочки или пустой, ищем в контексте
+        if clean_result == "Не указан" and ("**" in result or "*" in result):
+            # Ищем реальное значение в соседних строках
+            real_result = self._extract_real_value_from_context(all_lines, line_index, "result")
+            if real_result:
+                # Очищаем найденное значение
+                clean_result = self._clean_result(real_result)
+                logging.info(f"Найдено реальное значение в контексте: {real_result} -> {clean_result}")
+        
+        # Если все еще не указан, ищем по ключевым словам в контексте
+        if clean_result == "Не указан":
+            context_result = self._search_result_in_context(all_lines, line_index)
+            if context_result:
+                clean_result = context_result
+                logging.info(f"Найдено значение по ключевым словам: {clean_result}")
+        
+        return clean_result
+    
+    def _search_result_in_context(self, all_lines: List[str], line_index: int) -> Optional[str]:
+        """Ищет результат анализа по ключевым словам в контексте"""
+        try:
+            search_range = 10  # Увеличиваем диапазон поиска
+            
+            for i in range(max(0, line_index - search_range), min(len(all_lines), line_index + search_range + 1)):
+                line = all_lines[i].strip()
+                if not line:
+                    continue
+                
+                # Ищем строки с результатами анализов
+                if any(keyword in line.lower() for keyword in [
+                    'отрицательно', 'положительно', 'negative', 'positive',
+                    'норма', 'норме', 'в норме', 'в пределах нормы',
+                    'повышен', 'понижен', 'высокий', 'низкий',
+                    'нормальный', 'патологический', 'патология'
+                ]):
+                    # Если строка содержит двоеточие, извлекаем значение
+                    if ':' in line:
+                        parts = line.split(':', 1)
+                        if len(parts) == 2:
+                            value = parts[1].strip()
+                            if value and value != "**" and value != "*":
+                                # Очищаем найденное значение
+                                clean_value = self._clean_result(value)
+                                if clean_value != "Не указан":
+                                    return clean_value
+                    else:
+                        # Если нет двоеточия, проверяем всю строку
+                        if line and line != "**" and line != "*":
+                            # Проверяем, что это не название теста
+                            if not any(test_keyword in line.lower() for test_keyword in [
+                                'anti-', 'igg', 'igm', 'ige', 'гепатит', 'аллергия',
+                                'тест-система', 'оборудование', 'abbott', 'roche'
+                            ]):
+                                clean_value = self._clean_result(line)
+                                if clean_value != "Не указан":
+                                    return clean_value
+            
+            return None
+            
+        except Exception as e:
+            logging.error(f"Ошибка при поиске результата в контексте: {e}")
+            return None
     
     def _extract_real_value_from_context(self, all_lines: List[str], line_index: int, field_name: str) -> Optional[str]:
         """Извлекает реальное значение поля из контекста строк"""
@@ -498,6 +563,137 @@ class TestExtractionAgent:
         except Exception as e:
             logging.error(f"Ошибка при определении недостающих данных: {e}")
             return []
+
+    async def cleanup_existing_test_results(self, user_id: str) -> Dict[str, Any]:
+        """
+        Очищает существующие результаты анализов от лишних символов и форматирования
+        """
+        try:
+            logging.info(f"Начинаю очистку результатов анализов для пользователя: {user_id}")
+            
+            # Получаем все структурированные тесты пользователя
+            tests = self.supabase.table("doc_structured_test_results").select("*").eq(
+                "user_id", user_id).execute()
+            
+            if not tests.data:
+                logging.info("Нет анализов для очистки")
+                return {"success": True, "message": "Нет анализов для очистки", "cleaned_count": 0}
+            
+            cleaned_count = 0
+            updated_tests = []
+            
+            for test in tests.data:
+                test_id = test.get("id")
+                test_name = test.get("test_name", "")
+                result = test.get("result", "")
+                test_system = test.get("test_system", "")
+                equipment = test.get("equipment", "")
+                
+                # Проверяем, нужна ли очистка
+                needs_cleaning = False
+                cleaned_result = result
+                cleaned_test_system = test_system
+                cleaned_equipment = equipment
+                
+                # Очищаем результат
+                if result and ("**" in result or "*" in result):
+                    cleaned_result = self._clean_result(result)
+                    if cleaned_result != result:
+                        needs_cleaning = True
+                
+                # Очищаем тест-систему
+                if test_system and ("**" in test_system or "*" in test_system):
+                    cleaned_test_system = self._clean_result(test_system)
+                    if cleaned_test_system != test_system:
+                        needs_cleaning = True
+                
+                # Очищаем оборудование
+                if equipment and ("**" in equipment or "*" in equipment):
+                    cleaned_equipment = self._clean_result(equipment)
+                    if cleaned_equipment != equipment:
+                        needs_cleaning = True
+                
+                # Если нужна очистка, обновляем запись
+                if needs_cleaning:
+                    try:
+                        update_data = {
+                            "result": cleaned_result,
+                            "test_system": cleaned_test_system,
+                            "equipment": cleaned_equipment,
+                            "updated_at": datetime.now().isoformat()
+                        }
+                        
+                        # Обновляем запись в базе
+                        self.supabase.table("doc_structured_test_results").update(update_data).eq(
+                            "id", test_id).execute()
+                        
+                        cleaned_count += 1
+                        updated_tests.append({
+                            "id": test_id,
+                            "test_name": test_name,
+                            "old_result": result,
+                            "new_result": cleaned_result,
+                            "old_test_system": test_system,
+                            "new_test_system": cleaned_test_system,
+                            "old_equipment": equipment,
+                            "new_equipment": cleaned_equipment
+                        })
+                        
+                        logging.info(f"Очищен анализ {test_id}: {test_name}")
+                        
+                    except Exception as e:
+                        logging.error(f"Ошибка при очистке анализа {test_id}: {e}")
+            
+            result = {
+                "success": True,
+                "message": f"Очистка завершена. Очищено {cleaned_count} анализов",
+                "cleaned_count": cleaned_count,
+                "updated_tests": updated_tests
+            }
+            
+            logging.info(f"Очистка завершена: {cleaned_count} анализов очищено")
+            return result
+            
+        except Exception as e:
+            logging.error(f"Ошибка при очистке результатов анализов: {e}")
+            return {"success": False, "message": str(e), "cleaned_count": 0}
+
+    async def reprocess_medical_records(self, user_id: str) -> Dict[str, Any]:
+        """
+        Переобрабатывает медицинские записи для улучшения структурированных данных
+        """
+        try:
+            logging.info(f"Начинаю переобработку медицинских записей для пользователя: {user_id}")
+            
+            # Получаем все медицинские записи пользователя
+            medical_records = self._get_medical_records(user_id)
+            
+            if not medical_records:
+                logging.info("Нет медицинских записей для переобработки")
+                return {"success": False, "message": "Нет медицинских записей для переобработки"}
+            
+            # Удаляем старые структурированные данные
+            old_tests = self.supabase.table("doc_structured_test_results").select("*").eq(
+                "user_id", user_id).execute()
+            
+            if old_tests.data:
+                for test in old_tests.data:
+                    self.supabase.table("doc_structured_test_results").delete().eq("id", test.get("id")).execute()
+                
+                logging.info(f"Удалено {len(old_tests.data)} старых записей анализов")
+            
+            # Переобрабатываем записи с улучшенной логикой
+            result = await self.extract_and_structure_tests(user_id)
+            
+            if result.get("success"):
+                result["message"] = f"Переобработка завершена. Извлечено {result.get('tests_count', 0)} анализов"
+                result["reprocessed"] = True
+            
+            return result
+            
+        except Exception as e:
+            logging.error(f"Ошибка при переобработке медицинских записей: {e}")
+            return {"success": False, "message": str(e)}
 
 
 class StructuredTestAgent:
@@ -736,3 +932,134 @@ class StructuredTestAgent:
             return "Биохимический анализ"
         else:
             return "Другие анализы"
+
+    async def cleanup_existing_test_results(self, user_id: str) -> Dict[str, Any]:
+        """
+        Очищает существующие результаты анализов от лишних символов и форматирования
+        """
+        try:
+            logging.info(f"Начинаю очистку результатов анализов для пользователя: {user_id}")
+            
+            # Получаем все структурированные тесты пользователя
+            tests = self.supabase.table("doc_structured_test_results").select("*").eq(
+                "user_id", user_id).execute()
+            
+            if not tests.data:
+                logging.info("Нет анализов для очистки")
+                return {"success": True, "message": "Нет анализов для очистки", "cleaned_count": 0}
+            
+            cleaned_count = 0
+            updated_tests = []
+            
+            for test in tests.data:
+                test_id = test.get("id")
+                test_name = test.get("test_name", "")
+                result = test.get("result", "")
+                test_system = test.get("test_system", "")
+                equipment = test.get("equipment", "")
+                
+                # Проверяем, нужна ли очистка
+                needs_cleaning = False
+                cleaned_result = result
+                cleaned_test_system = test_system
+                cleaned_equipment = equipment
+                
+                # Очищаем результат
+                if result and ("**" in result or "*" in result):
+                    cleaned_result = self._clean_result(result)
+                    if cleaned_result != result:
+                        needs_cleaning = True
+                
+                # Очищаем тест-систему
+                if test_system and ("**" in test_system or "*" in test_system):
+                    cleaned_test_system = self._clean_result(test_system)
+                    if cleaned_test_system != test_system:
+                        needs_cleaning = True
+                
+                # Очищаем оборудование
+                if equipment and ("**" in equipment or "*" in equipment):
+                    cleaned_equipment = self._clean_result(equipment)
+                    if cleaned_equipment != equipment:
+                        needs_cleaning = True
+                
+                # Если нужна очистка, обновляем запись
+                if needs_cleaning:
+                    try:
+                        update_data = {
+                            "result": cleaned_result,
+                            "test_system": cleaned_test_system,
+                            "equipment": cleaned_equipment,
+                            "updated_at": datetime.now().isoformat()
+                        }
+                        
+                        # Обновляем запись в базе
+                        self.supabase.table("doc_structured_test_results").update(update_data).eq(
+                            "id", test_id).execute()
+                        
+                        cleaned_count += 1
+                        updated_tests.append({
+                            "id": test_id,
+                            "test_name": test_name,
+                            "old_result": result,
+                            "new_result": cleaned_result,
+                            "old_test_system": test_system,
+                            "new_test_system": cleaned_test_system,
+                            "old_equipment": equipment,
+                            "new_equipment": cleaned_equipment
+                        })
+                        
+                        logging.info(f"Очищен анализ {test_id}: {test_name}")
+                        
+                    except Exception as e:
+                        logging.error(f"Ошибка при очистке анализа {test_id}: {e}")
+            
+            result = {
+                "success": True,
+                "message": f"Очистка завершена. Очищено {cleaned_count} анализов",
+                "cleaned_count": cleaned_count,
+                "updated_tests": updated_tests
+            }
+            
+            logging.info(f"Очистка завершена: {cleaned_count} анализов очищено")
+            return result
+            
+        except Exception as e:
+            logging.error(f"Ошибка при очистке результатов анализов: {e}")
+            return {"success": False, "message": str(e), "cleaned_count": 0}
+    
+    async def reprocess_medical_records(self, user_id: str) -> Dict[str, Any]:
+        """
+        Переобрабатывает медицинские записи для улучшения структурированных данных
+        """
+        try:
+            logging.info(f"Начинаю переобработку медицинских записей для пользователя: {user_id}")
+            
+            # Получаем все медицинские записи пользователя
+            medical_records = self._get_medical_records(user_id)
+            
+            if not medical_records:
+                logging.info("Нет медицинских записей для переобработки")
+                return {"success": False, "message": "Нет медицинских записей для переобработки"}
+            
+            # Удаляем старые структурированные данные
+            old_tests = self.supabase.table("doc_structured_test_results").select("*").eq(
+                "user_id", user_id).execute()
+            
+            if old_tests.data:
+                for test in old_tests.data:
+                    self.supabase.table("doc_structured_test_results").delete().eq("id", test.get("id")).execute()
+                
+                logging.info(f"Удалено {len(old_tests.data)} старых записей анализов")
+            
+            # Переобрабатываем записи с улучшенной логикой
+            result = await self.extract_and_structure_tests(user_id)
+            
+            if result.get("success"):
+                result["message"] = f"Переобработка завершена. Извлечено {result.get('tests_count', 0)} анализов"
+                result["reprocessed"] = True
+            
+            return result
+            
+        except Exception as e:
+            logging.error(f"Ошибка при переобработке медицинских записей: {e}")
+            return {"success": False, "message": str(e)}

@@ -68,11 +68,11 @@ MODEL_CONFIG = {
         "api_key": os.getenv("GROQ_API_KEY"),
         "base_url": "https://api.groq.com/openai/v1",
         "models": [
-            {"name": "meta-llama/llama-4-scout-17b-16e-instruct:free", "priority": 1, "type": "vision"},
-            {"name": "meta-llama/llama-4-maverick-17b-128e-instruct:free", "priority": 2, "type": "vision"},
-            {"name": "llama-3.2-90b-vision-preview:free", "priority": 3, "type": "vision"},
-            {"name": "deepseek-r1-distill-llama-70b", "priority": 4, "type": "text"},
-            {"name": "openai/gpt-oss-120b", "priority": 5, "type": "text"}
+            {"name": "llama-3.2-90b-vision-preview", "priority": 1, "type": "vision"},
+            {"name": "llama-3.2-90b-instruct", "priority": 2, "type": "text"},
+            {"name": "llama-3.2-8b-instruct", "priority": 3, "type": "text"},
+            {"name": "llama-3.2-1b-instruct", "priority": 4, "type": "text"},
+            {"name": "mixtral-8x7b-32768", "priority": 5, "type": "text"}
         ],
         "client": None  # Будет инициализирован позже
     },
