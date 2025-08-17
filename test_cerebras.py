@@ -57,7 +57,7 @@ async def test_cerebras_connection():
         completion = client.chat.completions.create(
             model=model_name,
             messages=messages,
-            max_completion_tokens=100,
+            max_tokens=100,
             temperature=0.1
         )
         
