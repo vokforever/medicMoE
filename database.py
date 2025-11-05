@@ -1,7 +1,7 @@
 import logging
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from config import supabase
 
@@ -305,6 +305,284 @@ def get_user_successful_responses(user_id: str, limit: int = 10) -> List[Dict[st
     except Exception as e:
         logging.error(f"Ошибка при получении успешных ответов пользователя {user_id}: {e}")
         return []
+
+# Функция для удаления анализа
+async def delete_test_result(user_id: str, test_id: int) -> bool:
+    """Удаляет конкретный анализ пользователя"""
+    try:
+        logging.info(f"Удаление анализа {test_id} для пользователя {user_id}")
+        
+        # Сначала удаляем связанные записи из structured_test_results (дочерняя таблица)
+        try:
+            structured_response = supabase.table("structured_test_results") \
+                .delete() \
+                .eq("source_record_id", test_id) \
+                .execute()
+            if structured_response.data:
+                logging.info(f"Удалено {len(structured_response.data)} связанных структурированных результатов")
+        except Exception as e:
+            logging.warning(f"Ошибка при удалении связанных структурированных результатов: {e}")
+        
+        # Затем удаляем сам анализ из doc_structured_test_results (родительская таблица)
+        response = supabase.table("doc_structured_test_results") \
+            .delete() \
+            .eq("id", test_id) \
+            .eq("user_id", user_id) \
+            .execute()
+        
+        success = len(response.data) > 0 if response.data else False
+        if success:
+            logging.info(f"Анализ {test_id} успешно удален")
+        else:
+            logging.warning(f"Не удалось удалить анализ {test_id}")
+            
+        return success
+        
+    except Exception as e:
+        logging.error(f"Ошибка при удалении анализа: {e}")
+        return False
+
+# Функция для получения последних анализов пользователя
+def get_latest_test_results(user_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """Получает последние анализы пользователя"""
+    try:
+        logging.info(f"Получение последних анализов для пользователя {user_id}")
+        
+        response = supabase.table("doc_structured_test_results").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(limit).execute()
+        
+        tests = response.data if response.data else []
+        logging.info(f"Найдено {len(tests)} последних анализов")
+        
+        return tests
+        
+    except Exception as e:
+        logging.error(f"Ошибка при получении последних анализов: {e}")
+        return []
+
+# Функция для удаления всех анализов пользователя
+async def delete_all_test_results(user_id: str) -> int:
+    """Удаляет все анализы пользователя"""
+    try:
+        logging.info(f"Удаление всех анализов для пользователя {user_id}")
+        
+        # Сначала получаем все ID анализов пользователя для удаления связанных записей
+        try:
+            # Получаем все анализы пользователя
+            tests_response = supabase.table("doc_structured_test_results") \
+                .select("id") \
+                .eq("user_id", user_id) \
+                .execute()
+            
+            if tests_response.data:
+                test_ids = [test["id"] for test in tests_response.data]
+                
+                # Удаляем связанные записи из structured_test_results
+                for test_id in test_ids:
+                    try:
+                        structured_response = supabase.table("structured_test_results") \
+                            .delete() \
+                            .eq("source_record_id", test_id) \
+                            .execute()
+                        if structured_response.data:
+                            logging.info(f"Удалено {len(structured_response.data)} связанных записей для анализа {test_id}")
+                    except Exception as e:
+                        logging.warning(f"Ошибка при удалении связанных записей для анализа {test_id}: {e}")
+                        
+        except Exception as e:
+            logging.warning(f"Ошибка при получении списка анализов для очистки связанных записей: {e}")
+        
+        # Затем удаляем все анализы пользователя
+        response = supabase.table("doc_structured_test_results").delete().eq("user_id", user_id).execute()
+        
+        deleted_count = len(response.data) if response.data else 0
+        logging.info(f"Удалено {deleted_count} анализов для пользователя {user_id}")
+        
+        return deleted_count
+        
+    except Exception as e:
+        logging.error(f"Ошибка при удалении всех анализов: {e}")
+        return 0
+
+# Функция для удаления анализов за период
+async def delete_test_results_by_period(user_id: str, period: str) -> int:
+    """Удаляет анализы за указанный период"""
+    try:
+        logging.info(f"Удаление анализов за период {period} для пользователя {user_id}")
+        
+        # Определяем дату начала периода
+        now = datetime.now()
+        if period == "today":
+            start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        elif period == "week":
+            start_date = now - timedelta(days=7)
+        elif period == "month":
+            start_date = now - timedelta(days=30)
+        elif period == "year":
+            start_date = now - timedelta(days=365)
+        else:
+            logging.warning(f"Неизвестный период: {period}")
+            return 0
+        
+        # Сначала получаем анализы за период для удаления связанных записей
+        try:
+            tests_response = supabase.table("doc_structured_test_results") \
+                .select("id") \
+                .eq("user_id", user_id) \
+                .gte("created_at", start_date.isoformat()) \
+                .execute()
+            
+            if tests_response.data:
+                test_ids = [test["id"] for test in tests_response.data]
+                
+                # Удаляем связанные записи из structured_test_results
+                for test_id in test_ids:
+                    try:
+                        structured_response = supabase.table("structured_test_results") \
+                            .delete() \
+                            .eq("source_record_id", test_id) \
+                            .execute()
+                        if structured_response.data:
+                            logging.info(f"Удалено {len(structured_response.data)} связанных записей для анализа {test_id}")
+                    except Exception as e:
+                        logging.warning(f"Ошибка при удалении связанных записей для анализа {test_id}: {e}")
+                        
+        except Exception as e:
+            logging.warning(f"Ошибка при получении списка анализов за период {period}: {e}")
+        
+        # Затем удаляем анализы за период
+        response = supabase.table("doc_structured_test_results").delete().eq("user_id", user_id).gte("created_at", start_date.isoformat()).execute()
+        
+        deleted_count = len(response.data) if response.data else 0
+        logging.info(f"Удалено {deleted_count} анализов за период {period} для пользователя {user_id}")
+        
+        return deleted_count
+        
+    except Exception as e:
+        logging.error(f"Ошибка при удалении анализов за период: {e}")
+        return 0
+
+# Функция для удаления анализов до указанной даты
+async def delete_test_results_before_date(user_id: str, before_date: str) -> int:
+    """Удаляет анализы до указанной даты"""
+    try:
+        logging.info(f"Удаление анализов до {before_date} для пользователя {user_id}")
+        
+        # Сначала получаем анализы до указанной даты для удаления связанных записей
+        try:
+            tests_response = supabase.table("doc_structured_test_results") \
+                .select("id") \
+                .eq("user_id", user_id) \
+                .lt("created_at", before_date) \
+                .execute()
+            
+            if tests_response.data:
+                test_ids = [test["id"] for test in tests_response.data]
+                
+                # Удаляем связанные записи из structured_test_results
+                for test_id in test_ids:
+                    try:
+                        structured_response = supabase.table("structured_test_results") \
+                            .delete() \
+                            .eq("source_record_id", test_id) \
+                            .execute()
+                        if structured_response.data:
+                            logging.info(f"Удалено {len(structured_response.data)} связанных записей для анализа {test_id}")
+                    except Exception as e:
+                        logging.warning(f"Ошибка при удалении связанных записей для анализа {test_id}: {e}")
+                        
+        except Exception as e:
+            logging.warning(f"Ошибка при получении списка анализов до даты {before_date}: {e}")
+        
+        # Затем удаляем анализы до указанной даты
+        response = supabase.table("doc_structured_test_results").delete().eq("user_id", user_id).lt("created_at", before_date).execute()
+        
+        deleted_count = len(response.data) if response.data else 0
+        logging.info(f"Удалено {deleted_count} анализов до {before_date} для пользователя {user_id}")
+        
+        return deleted_count
+        
+    except Exception as e:
+        logging.error(f"Ошибка при удалении анализов до даты: {e}")
+        return 0
+
+# Функция для удаления медицинских записей
+async def delete_medical_record(user_id: str, record_id: int) -> bool:
+    """Удаляет конкретную медицинскую запись пользователя"""
+    try:
+        logging.info(f"Удаление медицинской записи {record_id} для пользователя {user_id}")
+        
+        # Сначала удаляем связанные структурированные результаты
+        try:
+            structured_response = supabase.table("structured_test_results") \
+                .delete() \
+                .eq("source_record_id", record_id) \
+                .execute()
+            if structured_response.data:
+                logging.info(f"Удалено {len(structured_response.data)} связанных структурированных результатов")
+        except Exception as e:
+            logging.warning(f"Ошибка при удалении связанных структурированных результатов: {e}")
+        
+        # Затем удаляем саму медицинскую запись
+        response = supabase.table("doc_medical_records") \
+            .delete() \
+            .eq("id", record_id) \
+            .eq("user_id", user_id) \
+            .execute()
+        
+        success = len(response.data) > 0 if response.data else False
+        if success:
+            logging.info(f"Медицинская запись {record_id} успешно удалена")
+        else:
+            logging.warning(f"Не удалось удалить медицинскую запись {record_id}")
+            
+        return success
+        
+    except Exception as e:
+        logging.error(f"Ошибка при удалении медицинской записи: {e}")
+        return False
+
+# Функция для удаления всех медицинских записей
+async def delete_all_medical_records(user_id: str) -> int:
+    """Удаляет все медицинские записи пользователя"""
+    try:
+        logging.info(f"Удаление всех медицинских записей для пользователя {user_id}")
+        
+        # Сначала получаем все ID записей для удаления связанных данных
+        try:
+            records_response = supabase.table("doc_medical_records") \
+                .select("id") \
+                .eq("user_id", user_id) \
+                .execute()
+            
+            if records_response.data:
+                record_ids = [record["id"] for record in records_response.data]
+                
+                # Удаляем связанные структурированные результаты
+                for record_id in record_ids:
+                    try:
+                        structured_response = supabase.table("structured_test_results") \
+                            .delete() \
+                            .eq("source_record_id", record_id) \
+                            .execute()
+                        if structured_response.data:
+                            logging.info(f"Удалено {len(structured_response.data)} связанных записей для медицинской записи {record_id}")
+                    except Exception as e:
+                        logging.warning(f"Ошибка при удалении связанных записей для медицинской записи {record_id}: {e}")
+                        
+        except Exception as e:
+            logging.warning(f"Ошибка при получении списка медицинских записей: {e}")
+        
+        # Затем удаляем все медицинские записи
+        response = supabase.table("doc_medical_records").delete().eq("user_id", user_id).execute()
+        
+        deleted_count = len(response.data) if response.data else 0
+        logging.info(f"Удалено {deleted_count} медицинских записей для пользователя {user_id}")
+        
+        return deleted_count
+        
+    except Exception as e:
+        logging.error(f"Ошибка при удалении всех медицинских записей: {e}")
+        return 0
 
 # Функция для сохранения успешных ответов с цепочкой размышлений
 async def save_successful_response(

@@ -14,9 +14,9 @@ def escape_html(text: str) -> str:
     logging.debug(f"Экранирование HTML для текста длиной {len(text)} символов")
     
     escaped = (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
+        text.replace("&", "&")
+        .replace("<", "<")
+        .replace(">", ">")
     )
     
     logging.debug(f"HTML экранирован, результат длиной {len(escaped)} символов")
@@ -176,7 +176,7 @@ def save_to_vector_knowledge_base(question: str, answer: str, source: str = ""):
 async def search_medical_sources(query: str) -> str:
     try:
         from config import tavily_client
-        search_query = f"{query} медицина здоровье"
+        search_query = f"{query} медицинская здоровье"
         logging.info(f"Поиск в медицинских источниках: {search_query}")
         
         response = tavily_client.search(
@@ -377,10 +377,10 @@ async def extract_patient_data_from_text(text: str) -> Dict[str, Any]:
         
         if birth_date:
             current_age = calculate_age_from_birth_date(birth_date)
-            logging.info(f"Возраст вычислен по дате рождения (простой парсинг): {current_age}")
+            logging.info(f"Возраст вычислен по дате рождения (пРОСТой парсинг): {current_age}")
         elif extracted_age:
             current_age = calculate_current_age(extracted_age)
-            logging.info(f"Возраст вычислен по извлеченному возрасту (простой парсинг): {current_age}")
+            logging.info(f"Возраст вычислен по извлеченному возрасту (ПРОСТой парсинг): {current_age}")
 
         result = {
             "name": name_match.group(1).strip() if name_match else None,
@@ -398,7 +398,7 @@ async def extract_patient_data_from_text(text: str) -> Dict[str, Any]:
 
 # Функция для вычисления текущего возраста на основе указанного возраста
 def calculate_current_age(extracted_age: int) -> int:
-    """Вычисляет текущий возраст на основе указанного в документе"""
+    """Вычисляет текущий возраст на основе указанного в документе возраста"""
     try:
         current_year = datetime.now().year
         # Предполагаем, что возраст указан на момент создания документа
@@ -442,7 +442,7 @@ def parse_birth_date(date_str: str) -> Optional[str]:
         patterns = [
             r'(\d{1,2})[\.\/\-](\d{1,2})[\.\/\-](\d{4})',  # ДД.ММ.ГГГГ
             r'(\d{4})[\.\/\-](\d{1,2})[\.\/\-](\d{1,2})',  # ГГГГ.ММ.ДД
-            r'(\d{1,2})[\.\/\-](\d{1,2})[\.\/\-](\d{2})',  # ДД.ММ.ГГ
+            r'(\d{1,2})[\.\/\-](\d{1,2})[\.\/\-](\d{2})',  # ДД.ММ.ГГГ
             r'(\d{4})',  # Только год
         ]
         
@@ -685,7 +685,7 @@ async def is_duplicate_by_ai(new_content: str, existing_content: str) -> bool:
         Критерии для определения дубликата:
         1. Одинаковые типы анализов (например, anti-HEV IgG, anti-HCV, IgE и т.д.)
         2. Одинаковые результаты (положительные/отрицательные, числовые значения)
-        3. Одинавый пациент (имя, дата рождения)
+        3. Одинаковый пациент (имя, дата рождения)
         4. Анализы сданы в один день или очень близко по времени
 
         Ответь только "ДА" если это дубликат, или "НЕТ" если это разные анализы.
@@ -714,6 +714,64 @@ async def is_duplicate_by_ai(new_content: str, existing_content: str) -> bool:
         
     except Exception as e:
         logging.error(f"Ошибка при ИИ-анализе дублирования: {e}")
+        return False
+
+async def is_duplicate_by_ai_enhanced(new_content: str, existing_content: str) -> bool:
+    """
+    Улучшенная функция для определения дубликатов с учетом ошибок извлечения
+    """
+    try:
+        # Если один из контентов содержит ошибки, это не дубликат
+        if (len(new_content.strip()) < 100 or "не удалось извлечь" in new_content.lower() or "ошибка" in new_content.lower()):
+            logging.info("Новый контент содержит ошибки, не считаем дубликатом")
+            return False
+        
+        if (len(existing_content.strip()) < 100 or "не удалось извлечь" in existing_content.lower() or "ошибка" in existing_content.lower()):
+            logging.info("Существующий контент содержит ошибки, не считаем дубликатом")
+            return False
+        
+        # Формируем улучшенный промпт для ИИ
+        prompt = f"""
+        Ты - медицинский эксперт. Проанализируй два медицинских анализа и определи, являются ли они дубликатами.
+
+        ВНИМАНИЕ: Если один из анализов не содержит данных или содержит ошибку извлечения - это НЕ дубликат.
+
+        АНАЛИЗ 1 (новый):
+        {new_content[:1500]}
+
+        АНАЛИЗ 2 (существующий):
+        {existing_content[:1500]}
+
+        Правила:
+        1. Если в одном из анализов нет данных (пустой или ошибка извлечения) - это НЕ дубликат
+        2. Если оба анализа содержат данные, сравнивай по пациенту, типам тестов и результатам
+        3. Одинаковый пациент + одинаковые тесты + одинаковые результаты = ДА (дубликат)
+        4. Любое отличие = НЕТ (не дубликат)
+
+        Ответь только одним словом: ДА или НЕТ
+        """
+
+        # Используем доступную модель для анализа
+        analysis_result = await call_model_with_failover(
+            messages=[{"role": "user", "content": prompt}],
+            model_type="text"
+        )
+        
+        if analysis_result and isinstance(analysis_result, tuple):
+            response_text = analysis_result[0]
+            if response_text:
+                is_duplicate = "ДА" in response_text.upper() and "НЕТ" not in response_text.upper()
+                logging.info(f"Улучшенный ИИ определил дубликат: {is_duplicate} (ответ: {response_text[:100]}...)")
+                return is_duplicate
+        elif analysis_result and isinstance(analysis_result, str):
+            is_duplicate = "ДА" in analysis_result.upper() and "НЕТ" not in analysis_result.upper()
+            logging.info(f"Улучшенный ИИ определил дубликат: {is_duplicate} (ответ: {analysis_result[:100]}...)")
+            return is_duplicate
+        
+        return False
+        
+    except Exception as e:
+        logging.error(f"Ошибка при улучшенном ИИ-анализе дублирования: {e}")
         return False
 
 # Функция для проверки дублирования медицинских записей
@@ -753,6 +811,7 @@ async def check_duplicate_medical_record_ai_enhanced(user_id: str, content: str,
     """
     try:
         logging.info(f"Улучшенная ИИ-проверка дублирования для пользователя: {user_id}")
+        logging.info(f"Тип записи: {record_type}, длина контента: {len(content)} символов")
         
         # Получаем последние записи пользователя
         query = supabase.table("doc_medical_records").select("*").eq("user_id", user_id).eq("record_type", record_type)
@@ -762,16 +821,41 @@ async def check_duplicate_medical_record_ai_enhanced(user_id: str, content: str,
             logging.info("Записей для сравнения не найдено")
             return False
         
+        logging.info(f"Найдено {len(response.data)} предыдущих записей для сравнения")
+        
+        # Если контент содержит ошибки извлечения, не считаем дубликатом и разрешаем сохранение
+        if len(content.strip()) < 100 or "не удалось извлечь" in content.lower() or "ошибка" in content.lower():
+            logging.info("Контент содержит ошибки извлечения, разрешаем сохранение без проверки дубликатов")
+            return False
+        
         # Сначала проверяем по точным критериям
         for record in response.data:
-            if is_exact_duplicate_by_criteria(content, record.get("content", "")):
-                logging.info(f"Точные критерии обнаружили дубликат записи с ID: {record.get('id')}")
+            existing_content = record.get("content", "")
+            existing_record_id = record.get("id")
+            
+            logging.info(f"Сравнение с записью ID: {existing_record_id} по точным критериям")
+            
+            if is_exact_duplicate_by_criteria(content, existing_content):
+                logging.info(f"Точные критерии обнаружили дубликат записи с ID: {existing_record_id}")
                 return True
         
-        # Если точные критерии не сработали, используем ИИ как fallback
+        # Если точные критерии не сработали, используем улучшенную ИИ-проверку
         for record in response.data:
-            if await is_duplicate_by_ai(content, record.get("content", "")):
-                logging.info(f"ИИ обнаружил дубликат записи с ID: {record.get('id')}")
+            existing_content = record.get("content", "")
+            existing_record_id = record.get("id")
+            
+            logging.info(f"Сравнение с записью ID: {existing_record_id} с помощью ИИ")
+            
+            # Проверяем что существующий контент тоже не содержит ошибок
+            if len(existing_content.strip()) < 100 or "не удалось извлечь" in existing_content.lower():
+                logging.info(f"Запись ID: {existing_record_id} содержит ошибки, пропускаем ИИ-проверку")
+                continue
+            
+            # Используем улучшенный промпт для ИИ
+            is_duplicate = await is_duplicate_by_ai_enhanced(content, existing_content)
+            
+            if is_duplicate:
+                logging.info(f"Улучшенный ИИ обнаружил дубликат записи с ID: {existing_record_id}")
                 return True
         
         logging.info("Дубликаты не обнаружены")

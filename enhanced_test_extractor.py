@@ -253,25 +253,63 @@ class EnhancedTestExtractor:
             
             # Пытаемся извлечь JSON из ответа
             try:
+                logging.info(f"Парсинг ответа модели, длина: {len(response)} символов")
+                logging.info(f"Начало ответа: {response[:500]}...")
+                
                 # Если модель поддерживает function calling, ответ будет в формате JSON
                 if "extract_medical_tests" in response:
                     data = json.loads(response)
                     tests = data.get("extract_medical_tests", {}).get("tests", [])
                 else:
                     # Fallback - ищем JSON в тексте ответа
-                    json_match = re.search(r'\{.*\}', response, re.DOTALL)
-                    if json_match:
-                        json_str = json_match.group(0)
-                        data = json.loads(json_str)
-                        tests = data.get("tests", [])
-                    else:
-                        tests = []
+                    # Ищем JSON объект с массивом tests
+                    json_patterns = [
+                        r'\{[^{}]*"tests"\s*:\s*\[[^\]]*\][^{}]*\}',  # JSON с массивом tests
+                        r'\{[^{}]*"extract_medical_tests"[^{}]*\}',  # JSON с extract_medical_tests
+                        r'\{.*?\}',  # Любой JSON объект
+                    ]
+                    
+                    tests = []
+                    for pattern in json_patterns:
+                        json_match = re.search(pattern, response, re.DOTALL)
+                        if json_match:
+                            json_str = json_match.group(0)
+                            logging.info(f"Найден JSON: {json_str[:200]}...")
+                            
+                            try:
+                                data = json.loads(json_str)
+                                
+                                # Проверяем разные возможные структуры
+                                if "tests" in data:
+                                    tests = data.get("tests", [])
+                                elif "extract_medical_tests" in data:
+                                    tests = data.get("extract_medical_tests", {}).get("tests", [])
+                                elif isinstance(data, list):
+                                    tests = data
+                                
+                                if tests:
+                                    break
+                                    
+                            except json.JSONDecodeError as e:
+                                logging.warning(f"Не удалось распарсить JSON паттерном {pattern}: {e}")
+                                continue
+                    
+                    # Если все еще не нашли, пробуем извлечь тесты вручную
+                    if not tests:
+                        logging.info("JSON не найден, пробуем ручное извлечение")
+                        tests = self._extract_tests_manually(response)
                 
                 logging.info(f"Извлечено {len(tests)} структурированных анализов")
                 return tests
                 
             except json.JSONDecodeError as e:
                 logging.error(f"Ошибка парсинга JSON: {e}")
+                logging.error(f"Ответ модели: {response}")
+                # Пробуем ручное извлечение как fallback
+                return self._extract_tests_manually(response)
+            except Exception as e:
+                logging.error(f"Неожиданная ошибка при парсинге: {e}")
+                logging.error(f"Ответ модели: {response}")
                 return []
             
         except Exception as e:
@@ -471,6 +509,132 @@ class EnhancedTestExtractor:
             logging.error(f"Ошибка при извлечении метаданных: {e}")
             return {}
     
+    def _extract_tests_manually(self, response: str) -> List[Dict[str, Any]]:
+        """
+        Ручное извлечение тестов из текстового ответа модели как fallback
+        """
+        try:
+            logging.info("Начинаю ручное извлечение тестов из текстового ответа")
+            
+            tests = []
+            lines = response.split('\n')
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # Ищем паттерны медицинских анализов в тексте
+                for category, keywords in self.medical_test_patterns.items():
+                    for keyword in keywords:
+                        if keyword.lower() in line.lower():
+                            # Пытаемся извлечь данные из строки
+                            test_data = self._parse_test_line(line)
+                            if test_data:
+                                tests.append(test_data)
+                                logging.info(f"Ручное извлечение: {test_data['test_name']} = {test_data['result']}")
+                            break
+            
+            # Если не нашли по ключевым словам, пробуем общий парсинг
+            if not tests:
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    # Ищем строки с двоеточием (название: результат)
+                    if ':' in line and len(line) > 10:
+                        parts = line.split(':', 1)
+                        if len(parts) == 2:
+                            test_name = parts[0].strip()
+                            result = parts[1].strip()
+                            
+                            # Проверяем, что это похоже на медицинский анализ
+                            if self._looks_like_medical_test(test_name, result):
+                                test_data = {
+                                    "test_name": test_name,
+                                    "result": result,
+                                    "reference_values": "",
+                                    "units": "",
+                                    "test_system": "",
+                                    "equipment": "",
+                                    "test_date": ""
+                                }
+                                tests.append(test_data)
+                                logging.info(f"Общее извлечение: {test_name} = {result}")
+            
+            logging.info(f"Ручное извлечение завершено, найдено {len(tests)} тестов")
+            return tests
+            
+        except Exception as e:
+            logging.error(f"Ошибка при ручном извлечении тестов: {e}")
+            return []
+    
+    def _parse_test_line(self, line: str) -> Optional[Dict[str, Any]]:
+        """
+        Парсит строку с медицинским анализом
+        """
+        try:
+            # Ищем паттерн "Название: Результат"
+            if ':' in line:
+                parts = line.split(':', 1)
+                if len(parts) == 2:
+                    test_name = parts[0].strip()
+                    result = parts[1].strip()
+                    
+                    # Очищаем данные
+                    test_name = self._clean_test_name(test_name)
+                    result = self._clean_result(result)
+                    
+                    if test_name and result:
+                        return {
+                            "test_name": test_name,
+                            "result": result,
+                            "reference_values": "",
+                            "units": "",
+                            "test_system": "",
+                            "equipment": "",
+                            "test_date": ""
+                        }
+            
+            return None
+            
+        except Exception as e:
+            logging.error(f"Ошибка при парсинге строки анализа: {e}")
+            return None
+    
+    def _looks_like_medical_test(self, test_name: str, result: str) -> bool:
+        """
+        Проверяет, похожа ли строка на медицинский анализ
+        """
+        try:
+            # Проверяем ключевые слова в названии
+            medical_keywords = [
+                'anti-', 'igg', 'igm', 'ige', 'гепатит', 'hepatitis', 'аллергия', 'allergy',
+                'билирубин', 'алат', 'асат', 'ггт', 'щф', 'холестерин', 'глюкоза',
+                'креатинин', 'мочевина', 'белок', 'ттг', 'т3', 'т4', 'tsh', 't3', 't4',
+                'гемоглобин', 'эритроциты', 'лейкоциты', 'тромбоциты', 'соэ'
+            ]
+            
+            test_name_lower = test_name.lower()
+            if any(keyword in test_name_lower for keyword in medical_keywords):
+                return True
+            
+            # Проверяем результат
+            result_lower = result.lower()
+            if any(keyword in result_lower for keyword in ['отрицательно', 'положительно', 'норма', ' negative', 'positive']):
+                return True
+            
+            # Проверяем числовые значения
+            if re.search(r'\d+\.?\d*\s*(ме/мл|мг/л|г/л|ммоль/л|%)', result_lower):
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logging.error(f"Ошибка при проверке медицинского анализа: {e}")
+            return False
+
     async def extract_specific_test(self, text_content: str, test_name: str) -> Optional[Dict[str, Any]]:
         """
         Извлекает данные конкретного анализа по названию

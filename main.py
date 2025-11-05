@@ -13,14 +13,19 @@ from config import bot_token, supabase
 from models import call_model_with_failover, reset_provider_blocks
 from agents import ClarificationAgent, TestAnalysisAgent, IntelligentQueryAnalyzer
 from database import (
-    generate_user_uuid, create_patient_profile, get_patient_profile, save_medical_record, get_user_successful_responses
+    generate_user_uuid, create_patient_profile, get_patient_profile, save_medical_record, get_user_successful_responses,
+    delete_test_result, delete_all_test_results, delete_test_results_by_period, delete_test_results_before_date
 )
 from utils import (
     escape_html, escape_markdown, search_medical_sources, analyze_image, extract_text_from_pdf,
     check_duplicate_medical_record_ai_enhanced
 )
 from keyboards import (
-    get_feedback_keyboard, get_main_keyboard
+    get_feedback_keyboard, get_main_keyboard, get_manage_tests_keyboard, 
+    get_delete_test_keyboard, get_delete_medical_record_keyboard, get_confirm_delete_keyboard, 
+    get_confirm_delete_all_keyboard, get_confirm_delete_medical_record_keyboard,
+    get_confirm_delete_all_medical_records_keyboard, get_date_range_keyboard, 
+    get_confirm_delete_period_keyboard
 )
 
 # Импорт и инициализация агента для структурированных данных
@@ -484,6 +489,11 @@ class DoctorStates(StatesGroup):
     confirming_profile = State()
     updating_profile = State()
     waiting_for_test_data = State()  # Ожидание дополнения данных анализов
+    managing_tests = State()  # Состояние управления анализами
+    confirming_delete = State()  # Состояние подтверждения удаления
+    confirming_delete_all = State()  # Состояние подтверждения удаления всех
+    choosing_delete_period = State()  # Состояние выбора периода удаления
+    waiting_for_date = State()  # Ожидание ввода даты для удаления
 
 # Функция для генерации ответа с failover между провайдерами
 async def generate_answer_with_failover(
@@ -628,11 +638,8 @@ async def start_command(message: types.Message, state: FSMContext):
              f"• /profile - управление профилем пациента\n"
              f"• /tests - загрузка и анализ анализов\n"
              f"• /history - история диалогов\n"
-             f"• /cleanup_duplicates - очистка дублирующихся записей\n"
-             f"• /cleanup_tests - очистка результатов анализов от лишних символов\n"
-             f"• /reprocess_tests - переобработка медицинских записей\n"
-             f"• /enhanced_cleanup - комплексная очистка и исправление всех анализов\n\n"
-            f"🔍 Что вас интересует?",
+             f"• /manage_tests - управление анализами (удаление)\n\n"
+             f"🔍 Что вас интересует?",
             reply_markup=get_main_keyboard()
         )
     else:
@@ -646,13 +653,83 @@ async def start_command(message: types.Message, state: FSMContext):
              f"• /help - справка по использованию\n"
              f"• /profile - создание профиля пациента\n"
              f"• /tests - загрузка и анализ анализов\n"
-             f"• /cleanup_duplicates - очистка дублирующихся записей\n"
-             f"• /cleanup_tests - очистка результатов анализов от лишних символов\n"
-             f"• /reprocess_tests - переобработка медицинских записей\n"
-             f"• /enhanced_cleanup - комплексная очистка и исправление всех анализов\n\n"
+             f"• /manage_tests - управление анализами (удаление)\n\n"
             f"🔍 Что вас интересует?",
             reply_markup=get_main_keyboard()
         )
+
+# Обработчик команды /manage_tests
+@dp.message(Command("manage_tests"))
+async def manage_tests_command(message: types.Message, state: FSMContext):
+    """Команда для управления анализами"""
+    try:
+        from database import get_latest_test_results, get_medical_records
+        user_id = generate_user_uuid(message.from_user.id)
+        logging.info(f"Команда управления анализами от пользователя {message.from_user.id}")
+        
+        # Получаем последние анализы пользователя
+        tests = get_latest_test_results(user_id, limit=10)
+        
+        # Получаем медицинские записи (включая неудачные анализы изображений)
+        medical_records = get_medical_records(user_id, "image_analysis")
+        
+        if not tests and not medical_records:
+            await message.answer(
+                "📊 У вас пока нет сохраненных анализов.\n\n"
+                "Загрузите анализы через фото или PDF файлы, чтобы начать работу с ними.",
+                reply_markup=get_main_keyboard()
+            )
+            return
+        
+        await state.set_state(DoctorStates.managing_tests)
+        
+        # Формируем сообщение со списком анализов
+        response_text = "📊 **Ваши последние данные:**\n\n"
+        
+        # Добавляем успешные анализы
+        if tests:
+            response_text += "🔬 **Структурированные анализы:**\n"
+            for i, test in enumerate(tests):
+                test_name = test.get("test_name", "Неизвестный анализ")
+                test_date = test.get("created_at", "")[:10] if test.get("created_at") else "Не указана"
+                result = test.get("result", "Не указан")
+                
+                response_text += f"**{i+1}. {test_name}**\n"
+                response_text += f"📅 Дата: {test_date}\n"
+                response_text += f"🔬 Результат: {result}\n\n"
+        
+        # Добавляем медицинские записи (включая неудачные попытки)
+        if medical_records:
+            response_text += "📋 **Медицинские записи (включая изображения):**\n"
+            for i, record in enumerate(medical_records[:5]):  # Показываем последние 5
+                content = record.get("content", "")
+                created_at = record.get("created_at", "")[:10] if record.get("created_at") else "Не указана"
+                record_id = record.get("id", "N/A")
+                
+                # Определяем тип записи по содержимому
+                if "не удалось извлечь" in content.lower() or len(content.strip()) < 100:
+                    record_type = "❌ Неудачный анализ"
+                else:
+                    record_type = "✅ Успешный анализ"
+                
+                # Обрезаем контент для отображения
+                display_content = content[:100] + "..." if len(content) > 100 else content
+                
+                response_text += f"**{i+1}. {record_type}** (ID: {record_id})\n"
+                response_text += f"📅 Дата: {created_at}\n"
+                response_text += f"📝 Содержание: {display_content}\n\n"
+        
+        response_text += "💡 **Выберите действие:**"
+        
+        await message.answer(
+            response_text,
+            parse_mode="Markdown",
+            reply_markup=get_manage_tests_keyboard()
+        )
+        
+    except Exception as e:
+        logging.error(f"Ошибка при управлении анализами: {e}")
+        await message.answer("😔 Произошла ошибка при загрузке данных. Попробуйте еще раз.")
 
 # Обработчик команды /models для проверки статуса моделей
 @dp.message(Command("models"))
@@ -688,7 +765,7 @@ async def models_command(message: types.Message):
             percentage = (used / limit) * 100 if limit > 0 else 0
             status_text += f"  📊 Токены: {used}/{limit} ({percentage:.1f}%)\n"
 
-        status_text += "\n"
+    status_text += "\n"
 
     await message.answer(status_text, parse_mode="HTML")
 
@@ -719,7 +796,7 @@ async def profile_command(message: types.Message, state: FSMContext):
             "<b>Пол: [М/Ж]</b>",
             parse_mode="HTML"
         )
-        await state.set_state(DoctorStates.waiting_for_patient_id)
+    await state.set_state(DoctorStates.waiting_for_patient_id)
 
 # Обработчик команды /stats
 @dp.message(Command("stats"))
@@ -772,131 +849,6 @@ async def clear_command(message: types.Message, state: FSMContext):
         logging.error(f"Ошибка при очистке истории: {e}")
         await message.answer("😔 Не удалось очистить историю")
 
-# Обработчик команды /cleanup_duplicates
-@dp.message(Command("cleanup_duplicates"))
-async def cleanup_duplicates_command(message: types.Message):
-    try:
-        from utils import cleanup_duplicate_medical_records
-        user_id = generate_user_uuid(message.from_user.id)
-        deleted_count = cleanup_duplicate_medical_records(user_id)
-        
-        if deleted_count > 0:
-            await message.answer(f"🧹 Очистка завершена! Удалено {deleted_count} дублирующихся записей.")
-        else:
-            await message.answer("✅ Дублирующихся записей не найдено.")
-            
-    except Exception as e:
-        logging.error(f"Ошибка при очистке дубликатов: {e}")
-        await message.answer("😔 Не удалось очистить дубликаты")
-
-# Обработчик команды /cleanup_tests
-@dp.message(Command("cleanup_tests"))
-async def cleanup_tests_command(message: types.Message):
-    """Очищает результаты анализов от лишних символов форматирования"""
-    try:
-        user_id = generate_user_uuid(message.from_user.id)
-        
-        # Отправляем сообщение о начале очистки
-        processing_msg = await message.answer("🧹 Начинаю очистку результатов анализов... Пожалуйста, подождите.")
-        
-        # Импортируем агент для работы с анализами
-        from structured_tests_agent import TestExtractionAgent
-        agent = TestExtractionAgent(supabase)
-        
-        # Очищаем существующие результаты
-        cleanup_result = await agent.cleanup_existing_test_results(user_id)
-        
-        if cleanup_result.get("success"):
-            cleaned_count = cleanup_result.get("cleaned_count", 0)
-            if cleaned_count > 0:
-                await processing_msg.edit_text(
-                    f"✅ Очистка завершена!\n\n"
-                    f"🧹 Очищено {cleaned_count} результатов анализов от лишних символов.\n\n"
-                    f"Теперь ваши анализы будут отображаться корректно без лишних символов форматирования."
-                )
-            else:
-                await processing_msg.edit_text(
-                    "✅ Очистка завершена!\n\n"
-                    "Все ваши результаты анализов уже корректно отформатированы."
-                )
-        else:
-            await processing_msg.edit_text(
-                f"😔 Не удалось выполнить очистку: {cleanup_result.get('message', 'Неизвестная ошибка')}"
-            )
-            
-    except Exception as e:
-        logging.error(f"Ошибка при очистке результатов анализов: {e}")
-        await message.answer("😔 Не удалось очистить результаты анализов. Попробуйте позже.")
-
-# Обработчик команды /reprocess_tests
-@dp.message(Command("reprocess_tests"))
-async def reprocess_tests_command(message: types.Message):
-    """Переобрабатывает медицинские записи для улучшения структурированных данных"""
-    try:
-        user_id = generate_user_uuid(message.from_user.id)
-        
-        # Отправляем сообщение о начале переобработки
-        processing_msg = await message.answer("🔄 Начинаю переобработку медицинских записей... Это может занять некоторое время.")
-        
-        # Импортируем агент для работы с анализами
-        from structured_tests_agent import TestExtractionAgent
-        agent = TestExtractionAgent(supabase)
-        
-        # Переобрабатываем записи
-        reprocess_result = await agent.reprocess_medical_records(user_id)
-        
-        if reprocess_result.get("success"):
-            tests_count = reprocess_result.get("tests_count", 0)
-            await processing_msg.edit_text(
-                f"✅ Переобработка завершена!\n\n"
-                f"🔄 Переобработано {tests_count} анализов с улучшенной логикой.\n\n"
-                f"Теперь ваши анализы будут корректно структурированы и очищены от лишних символов."
-            )
-        else:
-            await processing_msg.edit_text(
-                f"😔 Не удалось выполнить переобработку: {reprocess_result.get('message', 'Неизвестная ошибка')}"
-            )
-            
-    except Exception as e:
-        logging.error(f"Ошибка при переобработке анализов: {e}")
-        await message.answer("😔 Не удалось переобработать анализы. Попробуйте позже.")
-
-# Обработчик команды /enhanced_cleanup
-@dp.message(Command("enhanced_cleanup"))
-async def enhanced_cleanup_command(message: types.Message):
-    """Выполняет комплексную очистку и исправление всех анализов"""
-    try:
-        user_id = generate_user_uuid(message.from_user.id)
-        
-        # Отправляем сообщение о начале очистки
-        processing_msg = await message.answer(
-            "🧹 Начинаю комплексную очистку анализов...\n\n"
-            "Это включает:\n"
-            "• Очистку от символов форматирования\n"
-            "• Исправление некорректных данных\n"
-            "• Удаление дубликатов\n"
-            "• Переобработку медицинских записей\n\n"
-            "Пожалуйста, подождите..."
-        )
-        
-        # Используем улучшенную очистку
-        from enhanced_database_cleanup import enhanced_cleanup_all_tests
-        cleanup_result = await enhanced_cleanup_all_tests(user_id, supabase)
-        
-        if cleanup_result.get("success"):
-            await processing_msg.edit_text(
-                f"✅ Комплексная очистка завершена!\n\n"
-                f"{cleanup_result.get('message', 'Очистка завершена')}"
-            )
-        else:
-            await processing_msg.edit_text(
-                f"😔 Не удалось выполнить очистку: {cleanup_result.get('message', 'Неизвестная ошибка')}"
-            )
-            
-    except Exception as e:
-        logging.error(f"Ошибка при комплексной очистке: {e}")
-        await message.answer("😔 Не удалось выполнить очистку. Попробуйте позже.")
-
 # Обработчик команды /reset_providers
 @dp.message(Command("reset_providers"))
 async def reset_providers_command(message: types.Message):
@@ -919,6 +871,515 @@ async def reset_providers_command(message: types.Message):
     except Exception as e:
         logging.error(f"Ошибка при сбросе блокировок провайдеров: {e}")
         await message.answer("😔 Не удалось сбросить блокировки провайдеров.")
+
+# Обработчики callback для управления анализами
+@dp.callback_query(F.data.startswith("delete_tests"))
+async def delete_tests_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик кнопки удаления анализов"""
+    try:
+        from database import get_latest_test_results
+        user_id = generate_user_uuid(callback.from_user.id)
+        logging.info(f"Пользователь {callback.from_user.id} выбрал удаление анализов")
+        
+        # Получаем последние анализы пользователя
+        tests = get_latest_test_results(user_id, limit=10)
+        
+        if not tests:
+            await callback.message.edit_text(
+                "📊 У вас пока нет сохраненных анализов для удаления.",
+                reply_markup=get_main_keyboard()
+            )
+            await state.clear()
+            return
+        
+        await state.set_state(DoctorStates.confirming_delete)
+        
+        # Формируем сообщение со списком анализов для удаления
+        response_text = "🗑️ **Выберите анализы для удаления:**\n\n"
+        
+        await callback.message.edit_text(
+            response_text,
+            parse_mode="Markdown",
+            reply_markup=get_delete_test_keyboard(tests)
+        )
+        
+        await callback.answer()
+        
+    except Exception as e:
+        logging.error(f"Ошибка при обработке удаления анализов: {e}")
+        await callback.message.edit_text("😔 Произошла ошибка. Попробуйте еще раз.")
+        await state.clear()
+
+@dp.callback_query(F.data.startswith("delete_all_tests"))
+async def delete_all_tests_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик кнопки удаления всех анализов"""
+    try:
+        user_id = generate_user_uuid(callback.from_user.id)
+        logging.info(f"Пользователь {callback.from_user.id} выбрал удаление всех анализов")
+        
+        await state.set_state(DoctorStates.confirming_delete_all)
+        
+        await callback.message.edit_text(
+            "⚠️ **Подтвердите удаление ВСЕХ анализов!**\n\n"
+            "⚠️ Это действие нельзя отменить! Все ваши анализы будут безвозвратно удалены.\n\n"
+            "Вы уверены, что хотите удалить все анализы?",
+            parse_mode="Markdown",
+            reply_markup=get_confirm_delete_all_keyboard()
+        )
+        
+        await callback.answer()
+        
+    except Exception as e:
+        logging.error(f"Ошибка при обработке удаления всех анализов: {e}")
+        await callback.message.edit_text("😔 Произошла ошибка. Попробуйте еще раз.")
+        await state.clear()
+
+@dp.callback_query(F.data.startswith("delete_medical_records"))
+async def delete_medical_records_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик кнопки удаления медицинских записей"""
+    try:
+        from database import get_medical_records
+        user_id = generate_user_uuid(callback.from_user.id)
+        logging.info(f"Пользователь {callback.from_user.id} выбрал удаление медицинских записей")
+        
+        # Получаем медицинские записи пользователя
+        medical_records = get_medical_records(user_id, "image_analysis")
+        
+        if not medical_records:
+            await callback.message.edit_text(
+                "📊 У вас пока нет медицинских записей для удаления.",
+                reply_markup=get_main_keyboard()
+            )
+            await state.clear()
+            return
+        
+        # Формируем сообщение со списком медицинских записей для удаления
+        response_text = "🗑️ **Выберите медицинские записи для удаления:**\n\n"
+        
+        await callback.message.edit_text(
+            response_text,
+            parse_mode="Markdown",
+            reply_markup=get_delete_medical_record_keyboard(medical_records)
+        )
+        
+        await callback.answer()
+        
+    except Exception as e:
+        logging.error(f"Ошибка при обработке удаления медицинских записей: {e}")
+        await callback.message.edit_text("😔 Произошла ошибка. Попробуйте еще раз.")
+        await state.clear()
+
+@dp.callback_query(F.data.startswith("delete_by_date"))
+async def delete_by_date_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик кнопки удаления по дате"""
+    try:
+        user_id = generate_user_uuid(callback.from_user.id)
+        logging.info(f"Пользователь {callback.from_user.id} выбрал удаление по дате")
+        
+        await state.set_state(DoctorStates.choosing_delete_period)
+        
+        await callback.message.edit_text(
+            "📅 **Выберите период для удаления:**\n\n"
+            "Будут удалены все анализы, созданные в выбранный период.",
+            parse_mode="Markdown",
+            reply_markup=get_date_range_keyboard()
+        )
+        
+        await callback.answer()
+        
+    except Exception as e:
+        logging.error(f"Ошибка при обработке удаления по дате: {e}")
+        await callback.message.edit_text("😔 Произошла ошибка. Попробуйте еще раз.")
+        await state.clear()
+
+@dp.callback_query(F.data.startswith("delete_test_"))
+async def delete_test_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик выбора конкретного анализа для удаления"""
+    try:
+        from database import get_latest_test_results
+        test_id = int(callback.data.split("_")[-1])
+        user_id = generate_user_uuid(callback.from_user.id)
+        
+        logging.info(f"Пользователь {callback.from_user.id} выбрал удаление анализа {test_id}")
+        
+        # Получаем информацию об анализе
+        tests = get_latest_test_results(user_id, limit=50)
+        test_to_delete = None
+        for test in tests:
+            if test.get('id') == test_id:
+                test_to_delete = test
+                break
+        
+        if test_to_delete:
+            test_name = test_to_delete.get('test_name', 'Неизвестный анализ')
+            await state.set_state(DoctorStates.confirming_delete)
+            await state.update_data({"test_id_to_delete": test_id, "test_name_to_delete": test_name})
+            
+            await callback.message.edit_text(
+                f"🗑️ **Подтвердите удаление:**\n\n"
+                f"Анализ: {test_name}\n\n"
+                f"⚠️ Это действие нельзя отменить!",
+                parse_mode="Markdown",
+                reply_markup=get_confirm_delete_keyboard(test_id, test_name)
+            )
+        else:
+            await callback.message.edit_text("❌ Анализ не найден.")
+            await state.clear()
+        
+        await callback.answer()
+        
+    except Exception as e:
+        logging.error(f"Ошибка при выборе анализа для удаления: {e}")
+        await callback.message.edit_text("😔 Произошла ошибка. Попробуйте еще раз.")
+        await state.clear()
+
+@dp.callback_query(F.data.startswith("delete_medical_record_"))
+async def delete_medical_record_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик выбора медицинской записи для удаления"""
+    try:
+        from database import get_medical_records, delete_medical_record
+        record_id = int(callback.data.split("_")[-1])
+        user_id = generate_user_uuid(callback.from_user.id)
+        
+        logging.info(f"Пользователь {callback.from_user.id} выбрал удаление медицинской записи {record_id}")
+        
+        # Получаем информацию о записи
+        medical_records = get_medical_records(user_id, "image_analysis")
+        record_to_delete = None
+        for record in medical_records:
+            if record.get('id') == record_id:
+                record_to_delete = record
+                break
+        
+        if record_to_delete:
+            content = record_to_delete.get("content", "")
+            created_at = record_to_delete.get("created_at", "")[:10] if record_to_delete.get("created_at") else "Не указана"
+            
+            # Определяем тип записи
+            if "не удалось извлечь" in content.lower() or len(content.strip()) < 100:
+                record_type = "❌ Неудачный анализ"
+            else:
+                record_type = "✅ Успешный анализ"
+            
+            # Обрезаем контент для отображения
+            display_content = content[:100] + "..." if len(content) > 100 else content
+            
+            await state.set_state(DoctorStates.confirming_delete)
+            await state.update_data({
+                "medical_record_id_to_delete": record_id, 
+                "medical_record_content": display_content,
+                "medical_record_type": record_type
+            })
+            
+            await callback.message.edit_text(
+                f"🗑️ **Подтвердите удаление медицинской записи:**\n\n"
+                f"Тип: {record_type}\n"
+                f"ID: {record_id}\n"
+                f"Дата: {created_at}\n"
+                f"Содержание: {display_content}\n\n"
+                f"⚠️ Это действие нельзя отменить!",
+                parse_mode="Markdown",
+                reply_markup=get_confirm_delete_medical_record_keyboard(record_id, record_type)
+            )
+        else:
+            await callback.message.edit_text("❌ Медицинская запись не найдена.")
+            await state.clear()
+        
+        await callback.answer()
+        
+    except Exception as e:
+        logging.error(f"Ошибка при выборе медицинской записи для удаления: {e}")
+        await callback.message.edit_text("😔 Произошла ошибка. Попробуйте еще раз.")
+        await state.clear()
+
+@dp.callback_query(F.data.startswith("confirm_delete_medical_record_"))
+async def confirm_delete_medical_record_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик подтверждения удаления медицинской записи"""
+    try:
+        from database import delete_medical_record
+        record_id = int(callback.data.split("_")[-1])
+        user_id = generate_user_uuid(callback.from_user.id)
+        
+        logging.info(f"Пользователь {callback.from_user.id} подтвердил удаление медицинской записи {record_id}")
+        
+        # Удаляем медицинскую запись
+        success = await delete_medical_record(user_id, record_id)
+        
+        if success:
+            await callback.message.edit_text(
+                f"✅ Медицинская запись ID:{record_id} успешно удалена!"
+            )
+        else:
+            await callback.message.edit_text("❌ Не удалось удалить медицинскую запись. Попробуйте еще раз.")
+            
+        await callback.answer()
+        await state.clear()
+        
+    except Exception as e:
+        logging.error(f"Ошибка при подтверждении удаления медицинской записи: {e}")
+        await callback.message.edit_text("😔 Произошла ошибка. Попробуйте еще раз.")
+        await callback.answer()
+
+@dp.callback_query(F.data == "delete_all_medical_records")
+async def delete_all_medical_records_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик кнопки удаления всех медицинских записей"""
+    try:
+        user_id = generate_user_uuid(callback.from_user.id)
+        logging.info(f"Пользователь {callback.from_user.id} выбрал удаление всех медицинских записей")
+        
+        await state.set_state(DoctorStates.confirming_delete_all)
+        
+        await callback.message.edit_text(
+            "⚠️ **Подтвердите удаление ВСЕХ медицинских записей!**\n\n"
+            "⚠️ Это действие нельзя отменить! Все ваши медицинские записи (включая изображения и PDF) будут безвозвратно удалены.\n\n"
+            "Вы уверены, что хотите удалить все медицинские записи?",
+            parse_mode="Markdown",
+            reply_markup=get_confirm_delete_all_medical_records_keyboard()
+        )
+        
+        await callback.answer()
+        
+    except Exception as e:
+        logging.error(f"Ошибка при обработке удаления всех медицинских записей: {e}")
+        await callback.message.edit_text("😔 Произошла ошибка. Попробуйте еще раз.")
+        await state.clear()
+
+@dp.callback_query(F.data == "confirm_delete_all_medical_records")
+async def confirm_delete_all_medical_records_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик подтверждения удаления всех медицинских записей"""
+    try:
+        from database import delete_all_medical_records
+        user_id = generate_user_uuid(callback.from_user.id)
+        logging.info(f"Пользователь {callback.from_user.id} подтвердил удаление всех медицинских записей")
+        
+        # Удаляем все медицинские записи
+        deleted_count = await delete_all_medical_records(user_id)
+        
+        await callback.message.edit_text(
+            f"✅ Удалено {deleted_count} медицинских записей!"
+        )
+        
+        logging.info(f"Пользователь {user_id} удалил {deleted_count} медицинских записей")
+        await state.clear()
+        await callback.answer()
+        
+    except Exception as e:
+        logging.error(f"Ошибка при удалении всех медицинских записей: {e}")
+        await callback.message.edit_text("😔 Произошла ошибка. Попробуйте еще раз.")
+        await state.clear()
+
+@dp.callback_query(F.data.startswith("confirm_delete_"))
+async def confirm_delete_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик подтверждения удаления анализа"""
+    try:
+        callback_data_parts = callback.data.split("_")
+        
+        # Проверяем, это удаление конкретного анализа или всех
+        if callback_data_parts[2] == "all":
+            # Это обработка удаления всех анализов - перенаправляем в нужный обработчик
+            await confirm_delete_all_callback(callback, state)
+            return
+        
+        # Удаление конкретного анализа
+        test_id = int(callback_data_parts[2])
+        user_id = generate_user_uuid(callback.from_user.id)
+        
+        # Получаем информацию об анализе для подтверждения
+        from database import get_latest_test_results
+        tests = get_latest_test_results(user_id, limit=50)
+        test_to_delete = None
+        for test in tests:
+            if test.get('id') == test_id:
+                test_to_delete = test
+                break
+        
+        if test_to_delete:
+            # Удаляем анализ
+            success = await delete_test_result(user_id, test_id)
+            if success:
+                await callback.message.edit_text(
+                    f"✅ Анализ **{test_to_delete.get('test_name', 'Неизвестный')}** успешно удален!"
+                )
+            else:
+                await callback.message.edit_text("❌ Не удалось удалить анализ. Попробуйте еще раз.")
+        else:
+            await callback.message.edit_text("❌ Анализ не найден.")
+            
+        await callback.answer()
+        await state.clear()
+        
+    except Exception as e:
+        logging.error(f"Ошибка при подтверждении удаления анализа: {e}")
+        await callback.message.edit_text("😔 Произошла ошибка. Попробуйте еще раз.")
+        await callback.answer()
+
+@dp.callback_query(F.data == "confirm_delete_all")
+async def confirm_delete_all_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик подтверждения удаления всех анализов"""
+    try:
+        user_id = generate_user_uuid(callback.from_user.id)
+        logging.info(f"Пользователь {callback.from_user.id} подтвердил удаление всех анализов")
+        
+        # Удаляем все анализы
+        deleted_count = await delete_all_test_results(user_id)
+        
+        await callback.message.edit_text(
+            f"✅ Удалено {deleted_count} анализов!"
+        )
+        
+        logging.info(f"Пользователь {user_id} удалил {deleted_count} анализов")
+        await state.clear()
+        await callback.answer()
+        
+    except Exception as e:
+        logging.error(f"Ошибка при удалении всех анализов: {e}")
+        await callback.message.edit_text("😔 Произошла ошибка. Попробуйте еще раз.")
+        await state.clear()
+
+@dp.callback_query(F.data.startswith("confirm_period_"))
+async def confirm_period_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик подтверждения удаления по периоду"""
+    try:
+        period = callback.data.split("_")[1]
+        user_id = generate_user_uuid(callback.from_user.id)
+        logging.info(f"Пользователь {callback.from_user.id} подтвердил удаление за период {period}")
+        
+        # Удаляем анализы за период
+        deleted_count = await delete_test_results_by_period(user_id, period)
+        
+        await callback.message.edit_text(
+            f"✅ Удалено {deleted_count} анализов за период {period}!"
+        )
+        
+        logging.info(f"Пользователь {user_id} удалил {deleted_count} анализов за период {period}")
+        await state.clear()
+        await callback.answer()
+        
+    except Exception as e:
+        logging.error(f"Ошибка при удалении анализов за период: {e}")
+        await callback.message.edit_text("😔 Произошла ошибка. Попробуйте еще раз.")
+        await state.clear()
+
+@dp.callback_query(F.data.startswith(("today", "week", "month", "year")))
+async def period_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик выбора периода удаления"""
+    try:
+        period_map = {
+            "delete_today": "сегодня",
+            "delete_week": "неделю", 
+            "delete_month": "месяц",
+            "delete_year": "год"
+        }
+        
+        period = period_map.get(callback.data, "неизвестный период")
+        user_id = generate_user_uuid(callback.from_user.id)
+        logging.info(f"Пользователь {callback.from_user.id} выбрал период {period}")
+        
+        await callback.message.edit_text(
+            f"📅 **Подтвердите удаление за {period}:**\n\n"
+            f"⚠️ Будут удалены все анализы за выбранный период!",
+            parse_mode="Markdown",
+            reply_markup=get_confirm_delete_period_keyboard(period)
+        )
+        
+        await callback.answer()
+        
+    except Exception as e:
+        logging.error(f"Ошибка при выборе периода удаления: {e}")
+        await callback.message.edit_text("😔 Произошла ошибка. Попробуйте еще раз.")
+        await state.clear()
+
+@dp.callback_query(F.data.startswith("delete_before_date"))
+async def delete_before_date_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик удаления до определенной даты"""
+    try:
+        user_id = generate_user_uuid(callback.from_user.id)
+        logging.info(f"Пользователь {callback.from_user.id} выбрал удаление до определенной даты")
+        
+        await callback.message.edit_text(
+            "📅 **Введите дату в формате ГГГГ-ММ-ДД:**\n\n"
+            "Например: 2024-01-01\n\n"
+            "Будут удалены все анализы, созданные до этой даты.",
+            parse_mode="Markdown"
+        )
+        
+        await state.set_state(DoctorStates.waiting_for_date)
+        await callback.answer()
+        
+    except Exception as e:
+        logging.error(f"Ошибка при обработке удаления до даты: {e}")
+        await callback.message.edit_text("😔 Произошла ошибка. Попробуйте еще раз.")
+        await state.clear()
+
+@dp.callback_query(F.data.in_(["cancel_manage", "cancel_delete"]))
+async def cancel_manage_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик отмены управления анализами"""
+    try:
+        logging.info(f"Пользователь {callback.from_user.id} отменил управление анализами")
+        
+        await callback.message.edit_text(
+            "❌ Операция отменена.",
+            reply_markup=get_main_keyboard()
+        )
+        
+        await state.clear()
+        await callback.answer()
+        
+    except Exception as e:
+        logging.error(f"Ошибка при отмене управления анализами: {e}")
+        await state.clear()
+
+@dp.callback_query(F.data == "view_all_tests")
+async def view_all_tests_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик просмотра всех анализов"""
+    try:
+        from database import get_latest_test_results
+        user_id = generate_user_uuid(callback.from_user.id)
+        logging.info(f"Пользователь {callback.from_user.id} запросил просмотр всех анализов")
+        
+        # Получаем все анализы пользователя
+        tests = get_latest_test_results(user_id, limit=20)
+        
+        if not tests:
+            await callback.message.edit_text(
+                "📊 У вас пока нет сохраненных анализов.",
+                reply_markup=get_main_keyboard()
+            )
+            return
+        
+        await state.clear()
+        
+        # Формируем сообщение со списком всех анализов
+        response_text = f"📊 **Все ваши анализы ({len(tests)}):**\n\n"
+        
+        for i, test in enumerate(tests):
+            test_name = test.get("test_name", "Неизвестный анализ")
+            test_date = test.get("created_at", "")[:10] if test.get("created_at") else "Не указана"
+            result = test.get("result", "Не указан")
+            ref_values = test.get("reference_values", "")
+            units = test.get("units", "")
+            
+            response_text += f"**{i+1}. {test_name}**\n"
+            response_text += f"📅 Дата: {test_date}\n"
+            response_text += f"🔬 Результат: {result}"
+            if units:
+                response_text += f" {units}"
+            if ref_values:
+                response_text += f" (норма: {ref_values})"
+            response_text += "\n\n"
+        
+        response_text += "\n💡 Используйте команду /manage_tests для управления анализами."
+        
+        await callback.message.edit_text(
+            response_text,
+            parse_mode="Markdown"
+        )
+        
+        await callback.answer()
+        
+    except Exception as e:
+        logging.error(f"Ошибка при просмотре всех анализов: {e}")
+        await callback.message.edit_text("😔 Произошла ошибка. Попробуйте еще раз.")
 
 # Обработчик текстовых сообщений
 @dp.message(F.text)
@@ -1181,6 +1642,41 @@ async def handle_profile_creation(message: types.Message, state: FSMContext):
         logging.error(f"Ошибка при создании профиля: {e}")
         await message.answer("😔 Произошла ошибка. Пожалуйста, попробуйте еще раз.")
 
+# Обработчик ввода даты для удаления
+@dp.message(DoctorStates.waiting_for_date)
+async def handle_date_input(message: types.Message, state: FSMContext):
+    """Обработчик ввода даты для удаления"""
+    try:
+        date_text = message.text.strip()
+        user_id = generate_user_uuid(message.from_user.id)
+        
+        # Проверяем формат даты
+        import re
+        date_pattern = r'^\d{4}-\d{2}-\d{2}$'  # ГГГГ-ММ-ДД
+        
+        if not re.match(date_pattern, date_text):
+            await message.answer(
+                "❌ Неверный формат даты. Используйте формат ГГГГ-ММ-ДД\n"
+                "Например: 2024-01-01"
+            )
+            return
+        
+        logging.info(f"Пользователь {message.from_user.id} ввел дату для удаления: {date_text}")
+        
+        # Удаляем анализы до указанной даты
+        deleted_count = await delete_test_results_before_date(user_id, date_text)
+        
+        await message.answer(
+            f"✅ Удалено {deleted_count} анализов до {date_text}!"
+        )
+        
+        logging.info(f"Пользователь {user_id} удалил {deleted_count} анализов до {date_text}")
+        await state.clear()
+        
+    except Exception as e:
+        logging.error(f"Ошибка при удалении анализов до даты: {e}")
+        await message.answer("😔 Произошла ошибка. Попробуйте еще раз.")
+
 # Функция для сброса счетчиков токенов
 def reset_token_usage():
     """Сбрасывает ежедневные счетчики использования токенов"""
@@ -1192,17 +1688,6 @@ def reset_token_usage():
         logging.info("Счетчики токенов сброшены")
     except Exception as e:
         logging.error(f"Ошибка при сбросе счетчиков токенов: {e}")
-
-# Функция для очистки дубликатов
-def cleanup_all_duplicates():
-    """Очищает дублирующиеся записи во всех таблицах"""
-    try:
-        logging.info("Запуск очистки дубликатов")
-        # Здесь можно добавить логику очистки дубликатов
-        # Пока просто логируем
-        logging.info("Очистка дубликатов завершена")
-    except Exception as e:
-        logging.error(f"Ошибка при очистке дубликатов: {e}")
 
 # Планировщик для отложенных напоминаний и сброса токенов
 @dp.startup()
@@ -1220,17 +1705,6 @@ async def on_startup():
         id="reset_token_usage"
     )
     logging.info("Добавлена задача ежедневного сброса токенов")
-    
-    # Добавляем задачу для еженедельной очистки дубликатов (каждое воскресенье в 2:00)
-    scheduler.add_job(
-        cleanup_all_duplicates,
-        "cron",
-        day_of_week="sun",
-        hour=2,
-        minute=0,
-        id="cleanup_duplicates"
-    )
-    logging.info("Добавлена задача еженедельной очистки дубликатов")
     
     # Добавляем задачу для ежедневного сброса блокировок провайдеров в полночь
     scheduler.add_job(
@@ -1431,7 +1905,6 @@ async def generate_pdf_analysis_description(test_parameters: List[Dict[str, Any]
         description += "\n💡 **Рекомендации:**\n"
         description += "• Проконсультируйтесь с врачом для детальной интерпретации результатов\n"
         description += "• При необходимости повторите анализы через рекомендованный промежуток времени\n"
-        description += "• Сохраните результаты для отслеживания динамики показателей\n"
         description += "• Обратите внимание на показатели, выходящие за пределы референсных значений"
         
         return description
