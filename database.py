@@ -329,9 +329,46 @@ async def save_successful_response(
             "provider": provider,
             "model": metadata.get("model", ""),
             "thinking": metadata.get("thinking", ""),
-            "usage": json.dumps(metadata.get("usage", {})),
             "created_at": datetime.now().isoformat()
         }
+        
+        # Обрабатываем usage данные отдельно, чтобы избежать ошибок сериализации
+        usage_data = metadata.get("usage", {})
+        if usage_data:
+            try:
+                # Если usage_data содержит объекты, которые нельзя сериализовать,
+                # преобразуем их в простые типы
+                if hasattr(usage_data, 'dict'):
+                    # Если это объект с методом dict()
+                    usage_serializable = usage_data.dict()
+                elif hasattr(usage_data, '__dict__'):
+                    # Если это обычный объект
+                    usage_serializable = {}
+                    for k, v in usage_data.__dict__.items():
+                        if isinstance(v, (str, int, float, bool, list, dict)):
+                            usage_serializable[k] = v
+                        else:
+                            # Преобразуем сложные объекты в строки
+                            usage_serializable[k] = str(v)
+                elif isinstance(usage_data, dict):
+                    # Если это уже словарь, проверяем значения
+                    usage_serializable = {}
+                    for k, v in usage_data.items():
+                        if isinstance(v, (str, int, float, bool, list, dict)):
+                            usage_serializable[k] = v
+                        else:
+                            usage_serializable[k] = str(v)
+                else:
+                    # Если это другой тип данных
+                    usage_serializable = {"value": str(usage_data)}
+                
+                save_data["usage"] = json.dumps(usage_serializable, ensure_ascii=False)
+                logging.info(f"Данные об использовании токенов сериализованы")
+            except Exception as e:
+                logging.warning(f"Ошибка при сериализации данных об использовании: {e}")
+                save_data["usage"] = json.dumps({"error": "serialization_failed", "details": str(e)})
+        else:
+            save_data["usage"] = json.dumps({})
 
         # Если есть история диалога, сохраняем ее
         if conversation_history:

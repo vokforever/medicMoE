@@ -465,11 +465,23 @@ class TestExtractionAgent:
             return None
     
     async def _parse_tests_with_ai(self, text: str) -> List[Dict[str, Any]]:
-        """Извлечение анализов с помощью ИИ"""
+        """Извлечение анализов с помощью улучшенного ИИ-экстрактора"""
         try:
-            # Здесь будет вызов ИИ для извлечения данных
-            # Пока возвращаем пустой список
-            return []
+            # Используем улучшенный экстрактор для извлечения данных
+            from enhanced_test_extractor import EnhancedTestExtractor
+            
+            extractor = EnhancedTestExtractor()
+            # Создаем временный URL из текста (для совместимости)
+            temp_url = f"data:text/plain,{text[:1000]}"
+            
+            # Извлекаем структурированные данные
+            extraction_result = await extractor.extract_tests_from_image(temp_url, "")
+            
+            if extraction_result.get("success"):
+                return extraction_result.get("structured_tests", [])
+            else:
+                logging.warning(f"Улучшенный экстрактор не сработал: {extraction_result.get('error')}")
+                return []
             
         except Exception as e:
             logging.error(f"Ошибка при ИИ-извлечении: {e}")

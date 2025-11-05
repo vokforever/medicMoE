@@ -345,35 +345,27 @@ class EnhancedRAGSystem:
             logging.error(f"Ошибка поиска в медицинских источниках: {e}")
             return "Ошибка поиска в медицинских источниках."
     
-    def _extract_keywords(self, query: str) -> List[str]:
-        """Извлечение ключевых слов из запроса"""
+    async def _extract_keywords(self, query: str) -> List[str]:
+        """Извлечение ключевых слов из запроса с использованием LLM"""
         try:
-            # Простое извлечение ключевых слов
-            keywords = []
-            query_lower = query.lower()
+            # Используем медицинский агент для извлечения ключевых слов
+            from medical_terms_agent import medical_terms_agent
             
-            # Медицинские термины
-            medical_terms = [
-                "гепатит", "hcv", "hbv", "hbsag", "антитела", "igg", "igm", "ige",
-                "opisthorchis", "toxocara", "lamblia", "ascaris", "hepatitis",
-                "ferritin", "tsh", "церулоплазмин", "с-реактивный белок"
-            ]
+            medical_keywords = await medical_terms_agent.extract_medical_keywords(query)
             
-            for term in medical_terms:
-                if term in query_lower:
-                    keywords.append(term)
+            # Если медицинские термины не найдены, используем общие слова
+            if not medical_keywords:
+                words = query.lower().split()
+                medical_keywords = [word for word in words if len(word) > 3][:3]
             
-            # Если ключевых слов не найдено, используем общие слова
-            if not keywords:
-                words = query_lower.split()
-                keywords = [word for word in words if len(word) > 3][:3]
-            
-            logging.info(f"Извлечены ключевые слова: {keywords}")
-            return keywords
+            logging.info(f"Извлечены ключевые слова: {medical_keywords}")
+            return medical_keywords
             
         except Exception as e:
             logging.error(f"Ошибка извлечения ключевых слов: {e}")
-            return []
+            # Fallback к простому методу
+            words = query.lower().split()
+            return [word for word in words if len(word) > 3][:3]
     
     async def process_query(self, user_id: str, query: str) -> Tuple[str, Dict[str, Any]]:
         """Обработка запроса с полным контекстом"""
@@ -638,7 +630,8 @@ async def start_command(message: types.Message, state: FSMContext):
              f"• /history - история диалогов\n"
              f"• /cleanup_duplicates - очистка дублирующихся записей\n"
              f"• /cleanup_tests - очистка результатов анализов от лишних символов\n"
-             f"• /reprocess_tests - переобработка медицинских записей\n\n"
+             f"• /reprocess_tests - переобработка медицинских записей\n"
+             f"• /enhanced_cleanup - комплексная очистка и исправление всех анализов\n\n"
             f"🔍 Что вас интересует?",
             reply_markup=get_main_keyboard()
         )
@@ -655,7 +648,8 @@ async def start_command(message: types.Message, state: FSMContext):
              f"• /tests - загрузка и анализ анализов\n"
              f"• /cleanup_duplicates - очистка дублирующихся записей\n"
              f"• /cleanup_tests - очистка результатов анализов от лишних символов\n"
-             f"• /reprocess_tests - переобработка медицинских записей\n\n"
+             f"• /reprocess_tests - переобработка медицинских записей\n"
+             f"• /enhanced_cleanup - комплексная очистка и исправление всех анализов\n\n"
             f"🔍 Что вас интересует?",
             reply_markup=get_main_keyboard()
         )
@@ -867,6 +861,42 @@ async def reprocess_tests_command(message: types.Message):
         logging.error(f"Ошибка при переобработке анализов: {e}")
         await message.answer("😔 Не удалось переобработать анализы. Попробуйте позже.")
 
+# Обработчик команды /enhanced_cleanup
+@dp.message(Command("enhanced_cleanup"))
+async def enhanced_cleanup_command(message: types.Message):
+    """Выполняет комплексную очистку и исправление всех анализов"""
+    try:
+        user_id = generate_user_uuid(message.from_user.id)
+        
+        # Отправляем сообщение о начале очистки
+        processing_msg = await message.answer(
+            "🧹 Начинаю комплексную очистку анализов...\n\n"
+            "Это включает:\n"
+            "• Очистку от символов форматирования\n"
+            "• Исправление некорректных данных\n"
+            "• Удаление дубликатов\n"
+            "• Переобработку медицинских записей\n\n"
+            "Пожалуйста, подождите..."
+        )
+        
+        # Используем улучшенную очистку
+        from enhanced_database_cleanup import enhanced_cleanup_all_tests
+        cleanup_result = await enhanced_cleanup_all_tests(user_id, supabase)
+        
+        if cleanup_result.get("success"):
+            await processing_msg.edit_text(
+                f"✅ Комплексная очистка завершена!\n\n"
+                f"{cleanup_result.get('message', 'Очистка завершена')}"
+            )
+        else:
+            await processing_msg.edit_text(
+                f"😔 Не удалось выполнить очистку: {cleanup_result.get('message', 'Неизвестная ошибка')}"
+            )
+            
+    except Exception as e:
+        logging.error(f"Ошибка при комплексной очистке: {e}")
+        await message.answer("😔 Не удалось выполнить очистку. Попробуйте позже.")
+
 # Обработчик команды /reset_providers
 @dp.message(Command("reset_providers"))
 async def reset_providers_command(message: types.Message):
@@ -946,11 +976,27 @@ async def handle_photo_message(message: types.Message, state: FSMContext):
             
             logging.info(f"URL файла: {full_url}")
             
-            # Анализируем изображение с помощью ИИ
-            analysis_result = await analyze_image(
-                full_url, 
-                "Проанализируй это медицинское изображение. Опиши что видишь, какие анализы показаны, их значения и что они означают."
+            # Используем улучшенный экстрактор для анализа изображения
+            from enhanced_test_extractor import extract_medical_tests_from_image
+            
+            # Извлекаем структурированные данные анализов
+            extraction_result = await extract_medical_tests_from_image(
+                full_url,
+                "Проанализируй это медицинское изображение и извлеки все анализы с результатами"
             )
+            
+            if extraction_result.get("success"):
+                # Генерируем описательный анализ на основе структурированных данных
+                analysis_result = await generate_analysis_description(extraction_result)
+                
+                # Сохраняем структурированные данные в базу
+                await save_structured_tests_from_image(user_id, extraction_result)
+            else:
+                # Fallback к обычному анализу, если улучшенный не сработал
+                analysis_result = await analyze_image(
+                    full_url,
+                    "Проанализируй это медицинское изображение. Опиши что видишь, какие анализы показаны, их значения и что они означают."
+                )
             
             # Проверяем дубликаты
             is_duplicate = await check_duplicate_medical_record_ai_enhanced(
@@ -1017,12 +1063,43 @@ async def handle_document_message(message: types.Message, state: FSMContext):
                 await processing_msg.edit_text("❌ Не удалось извлечь текст из PDF. Возможно, файл поврежден или защищен.")
                 return
             
-            # Анализируем текст с помощью ИИ
-            analysis_result = await call_model_with_failover(
-                messages=[{"role": "user", "content": f"Проанализируй этот медицинский документ и выдели ключевую информацию:\n\n{pdf_text}"}],
-                model_type="text",
-                system_prompt="Ты — медицинский эксперт. Проанализируй документ и выдели ключевую информацию о пациенте, анализах, диагнозах и рекомендациях."
-            )
+            # Используем медицинский агент для извлечения структурированных данных из PDF
+            from medical_terms_agent import medical_terms_agent
+            
+            try:
+                # Извлекаем параметры анализов с помощью LLM
+                test_parameters = await medical_terms_agent.extract_test_parameters(pdf_text)
+                
+                if test_parameters:
+                    # Генерируем анализ на основе структурированных данных
+                    analysis_result = await generate_pdf_analysis_description(test_parameters, pdf_text)
+                    
+                    # Сохраняем структурированные данные
+                    await save_structured_tests_from_pdf(user_id, test_parameters)
+                    
+                    logging.info(f"Извлечено {len(test_parameters)} параметров анализов из PDF")
+                else:
+                    # Fallback к обычному анализу, если структурированные данные не извлечены
+                    analysis_response = await call_model_with_failover(
+                        messages=[{"role": "user", "content": f"Проанализируй этот медицинский документ и выдели ключевую информацию:\n\n{pdf_text}"}],
+                        model_type="text",
+                        system_prompt="Ты — медицинский эксперт. Проанализируй документ и выдели ключевую информацию о пациенте, анализах, диагнозах и рекомендациях."
+                    )
+                    
+                    # Извлекаем текст из кортежа
+                    if isinstance(analysis_response, tuple) and len(analysis_response) > 0:
+                        analysis_result = analysis_response[0]
+                    else:
+                        analysis_result = str(analysis_response)
+                    
+            except Exception as e:
+                logging.error(f"Ошибка при извлечении параметров из PDF: {e}")
+                # Fallback к обычному анализу
+                analysis_result = await call_model_with_failover(
+                    messages=[{"role": "user", "content": f"Проанализируй этот медицинский документ и выдели ключевую информацию:\n\n{pdf_text}"}],
+                    model_type="text",
+                    system_prompt="Ты — медицинский эксперт. Проанализируй документ и выдели ключевую информацию о пациенте, анализах, диагнозах и рекомендациях."
+                )
             
             # Проверяем дубликаты
             is_duplicate = await check_duplicate_medical_record_ai_enhanced(
@@ -1170,6 +1247,219 @@ async def on_shutdown():
     logging.info("Остановка планировщика задач")
     scheduler.shutdown()
     logging.info("Планировщик задач остановлен")
+
+async def generate_analysis_description(extraction_result: Dict[str, Any]) -> str:
+    """
+    Генерирует описательный анализ на основе структурированных данных
+    """
+    try:
+        tests = extraction_result.get("structured_tests", [])
+        metadata = extraction_result.get("metadata", {})
+        
+        if not tests:
+            return "Не удалось извлечь данные анализов из изображения."
+        
+        # Формируем описание
+        description = "📊 **Анализ медицинских результатов:**\n\n"
+        
+        # Добавляем информацию о пациенте если есть
+        if metadata.get("patient_name"):
+            description += f"👤 **Пациент:** {metadata['patient_name']}\n"
+        
+        # Добавляем дату анализа если есть
+        test_dates = [test.get("test_date") for test in tests if test.get("test_date")]
+        if test_dates:
+            description += f"📅 **Дата анализа:** {test_dates[0]}\n"
+        
+        description += "\n**Результаты анализов:**\n\n"
+        
+        # Группируем анализы по категориям с использованием LLM
+        categories = {}
+        from medical_terms_agent import medical_terms_agent
+        
+        for test in tests:
+            test_name = test.get("test_name", "")
+            
+            # Используем LLM для категоризации
+            try:
+                category_data = await medical_terms_agent.categorize_medical_test(test_name)
+                category = category_data.get("category", "Другие анализы")
+            except Exception as e:
+                logging.error(f"Ошибка категоризации теста {test_name}: {e}")
+                # Fallback к простому методу
+                test_name_lower = test_name.lower()
+                if any(keyword in test_name_lower for keyword in ['anti-', 'гепатит', 'hcv', 'hbv', 'hev']):
+                    category = "Анализы на гепатиты"
+                elif any(keyword in test_name_lower for keyword in ['opisthorchis', 'toxocara', 'lamblia', 'ascaris']):
+                    category = "Паразитологические анализы"
+                elif 'ige' in test_name_lower or 'аллерг' in test_name_lower:
+                    category = "Аллергологические анализы"
+                elif any(keyword in test_name_lower for keyword in ['билирубин', 'алат', 'асат', 'ггт']):
+                    category = "Биохимические анализы"
+                else:
+                    category = "Другие анализы"
+            
+            if category not in categories:
+                categories[category] = []
+            categories[category].append(test)
+        
+        # Формируем результат по категориям
+        for category, category_tests in categories.items():
+            description += f"🔬 **{category}:**\n"
+            for test in category_tests:
+                test_name = test.get("test_name", "")
+                result = test.get("result", "")
+                ref_values = test.get("reference_values", "")
+                units = test.get("units", "")
+                
+                description += f"• **{test_name}:** {result}"
+                if units:
+                    description += f" {units}"
+                if ref_values:
+                    description += f" (норма: {ref_values})"
+                description += "\n"
+            description += "\n"
+        
+        # Добавляем информацию о лаборатории если есть
+        if metadata.get("laboratory"):
+            description += f"🏥 **Лаборатория:** {metadata['laboratory']}\n"
+        
+        # Добавляем рекомендации
+        description += "\n💡 **Рекомендации:**\n"
+        description += "• Проконсультируйтесь с врачом для детальной интерпретации результатов\n"
+        description += "• При необходимости повторите анализы через рекомендованный промежуток времени\n"
+        description += "• Сохраните результаты для отслеживания динамики показателей"
+        
+        return description
+        
+    except Exception as e:
+        logging.error(f"Ошибка при генерации описания анализа: {e}")
+        return "Произошла ошибка при анализе результатов. Попробуйте еще раз."
+
+async def save_structured_tests_from_image(user_id: str, extraction_result: Dict[str, Any]) -> int:
+    """
+    Сохраняет структурированные данные анализов в базу данных
+    """
+    try:
+        from database import save_medical_record
+        from structured_tests_agent import TestExtractionAgent
+        
+        tests = extraction_result.get("structured_tests", [])
+        if not tests:
+            return 0
+        
+        # Сохраняем сырой анализ как медицинскую запись
+        raw_analysis = extraction_result.get("raw_analysis", "")
+        await save_medical_record(user_id, "image_analysis", raw_analysis, "enhanced_extraction")
+        
+        # Используем существующий агент для сохранения структурированных данных
+        agent = TestExtractionAgent(supabase)
+        saved_count = await agent._save_structured_tests(user_id, tests)
+        
+        logging.info(f"Сохранено {saved_count} структурированных анализов из изображения")
+        return saved_count
+        
+    except Exception as e:
+        logging.error(f"Ошибка при сохранении структурированных анализов: {e}")
+        return 0
+
+async def generate_pdf_analysis_description(test_parameters: List[Dict[str, Any]], pdf_text: str) -> str:
+    """
+    Генерирует описательный анализ PDF на основе структурированных данных
+    """
+    try:
+        if not test_parameters:
+            return "Не удалось извлечь структурированные данные из PDF документа."
+        
+        # Формируем описание
+        description = "📋 **Анализ PDF документа с медицинскими анализами:**\n\n"
+        
+        # Группируем анализы по категориям с использованием LLM
+        from medical_terms_agent import medical_terms_agent
+        categories = {}
+        
+        for test in test_parameters:
+            test_name = test.get("test_name", "")
+            
+            # Используем LLM для категоризации
+            try:
+                category_data = await medical_terms_agent.categorize_medical_test(test_name)
+                category = category_data.get("category", "Другие анализы")
+            except Exception as e:
+                logging.error(f"Ошибка категоризации теста {test_name}: {e}")
+                # Fallback к простому методу
+                test_name_lower = test_name.lower()
+                if any(keyword in test_name_lower for keyword in ['anti-', 'гепатит', 'hcv', 'hbv', 'hev']):
+                    category = "Анализы на гепатиты"
+                elif any(keyword in test_name_lower for keyword in ['opisthorchis', 'toxocara', 'lamblia', 'ascaris']):
+                    category = "Паразитологические анализы"
+                elif 'ige' in test_name_lower or 'аллерг' in test_name_lower:
+                    category = "Аллергологические анализы"
+                elif any(keyword in test_name_lower for keyword in ['билирубин', 'алат', 'асат', 'ггт']):
+                    category = "Биохимические анализы"
+                else:
+                    category = "Другие анализы"
+            
+            if category not in categories:
+                categories[category] = []
+            categories[category].append(test)
+        
+        # Формируем результат по категориям
+        for category, category_tests in categories.items():
+            description += f"🔬 **{category}:**\n"
+            for test in category_tests:
+                test_name = test.get("test_name", "")
+                result = test.get("result", "")
+                ref_values = test.get("reference_values", "")
+                units = test.get("units", "")
+                test_date = test.get("test_date", "")
+                laboratory = test.get("laboratory", "")
+                
+                description += f"• **{test_name}:** {result}"
+                if units:
+                    description += f" {units}"
+                if ref_values:
+                    description += f" (норма: {ref_values})"
+                if test_date:
+                    description += f"\n  📅 Дата: {test_date}"
+                if laboratory:
+                    description += f"\n  🏥 Лаборатория: {laboratory}"
+                description += "\n"
+            description += "\n"
+        
+        # Добавляем рекомендации
+        description += "\n💡 **Рекомендации:**\n"
+        description += "• Проконсультируйтесь с врачом для детальной интерпретации результатов\n"
+        description += "• При необходимости повторите анализы через рекомендованный промежуток времени\n"
+        description += "• Сохраните результаты для отслеживания динамики показателей\n"
+        description += "• Обратите внимание на показатели, выходящие за пределы референсных значений"
+        
+        return description
+        
+    except Exception as e:
+        logging.error(f"Ошибка при генерации описания PDF анализа: {e}")
+        return "Произошла ошибка при анализе PDF документа. Попробуйте еще раз."
+
+async def save_structured_tests_from_pdf(user_id: str, test_parameters: List[Dict[str, Any]]) -> int:
+    """
+    Сохраняет структурированные данные анализов из PDF в базу данных
+    """
+    try:
+        from structured_tests_agent import TestExtractionAgent
+        
+        if not test_parameters:
+            return 0
+        
+        # Используем существующий агент для сохранения структурированных данных
+        agent = TestExtractionAgent(supabase)
+        saved_count = await agent._save_structured_tests(user_id, test_parameters)
+        
+        logging.info(f"Сохранено {saved_count} структурированных анализов из PDF")
+        return saved_count
+        
+    except Exception as e:
+        logging.error(f"Ошибка при сохранении структурированных анализов из PDF: {e}")
+        return 0
 
 # Запуск бота
 async def main():
