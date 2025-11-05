@@ -9,6 +9,12 @@ from dateutil.parser import parse
 from config import MEDICAL_SOURCES, supabase
 from models import call_model_with_failover
 
+# Импортируем types для безопасной отправки сообщений
+try:
+    from aiogram import types
+except ImportError:
+    types = None
+
 # Функция для экранирования HTML
 def escape_html(text: str) -> str:
     logging.debug(f"Экранирование HTML для текста длиной {len(text)} символов")
@@ -1006,3 +1012,29 @@ def is_exact_duplicate_by_criteria(content1: str, content2: str) -> bool:
     except Exception as e:
         logging.error(f"Ошибка при точной проверке дубликатов: {e}")
         return False
+
+# Безопасная функция отправки сообщений для Telegram
+async def safe_send_message(message: types.Message, text: str, reply_markup=None, parse_mode=None):
+    """
+    Безопасная отправка сообщения с обработкой HTML ошибок
+    """
+    try:
+        # Экранируем HTML символы если используется HTML парсинг
+        if parse_mode == "HTML":
+            text = escape_html(text)
+        elif parse_mode == "Markdown":
+            text = escape_markdown(text)
+        
+        await message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except Exception as e:
+        logging.error(f"Ошибка при отправке сообщения: {e}")
+        # Пробуем отправить без форматирования
+        try:
+            await message.answer(text, reply_markup=reply_markup)
+        except Exception as e2:
+            logging.error(f"Ошибка при повторной отправке сообщения: {e2}")
+            # Отправляем простое сообщение
+            try:
+                await message.answer("Произошла ошибка при отправке ответа. Попробуйте еще раз.")
+            except Exception as e3:
+                logging.error(f"Критическая ошибка отправки сообщения: {e3}")

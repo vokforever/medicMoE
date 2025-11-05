@@ -166,7 +166,7 @@ class SessionManager:
                 records = response.data
                 context = f"Медицинские записи: найдено {len(records)} записей\n"
                 
-                for i, record in enumerate(records[:3]):  # Показываем только последние 3
+                for i, record in enumerate(records[:3]):  # Показываем только последние3
                     record_type = record.get("record_type", "неизвестно")
                     created_at = record.get("created_at", "")
                     content = record.get("content", "")[:300]  # Ограничиваем длину
@@ -1411,85 +1411,87 @@ async def handle_text_message(message: types.Message, state: FSMContext):
         logging.error(f"Ошибка при обработке текстового сообщения: {e}")
         await message.answer("Извините, произошла ошибка при обработке вашего запроса. Попробуйте еще раз.")
 
-# Обработчик фото
+# Обработчик фото - УПРОЩЕННАЯ ВЕРСИЯ
 @dp.message(F.photo)
 async def handle_photo_message(message: types.Message, state: FSMContext):
-    """Обработчик фото с медицинскими анализами"""
+    """Упрощенный обработчик фото"""
     try:
         user_id = generate_user_uuid(message.from_user.id)
         logging.info(f"Получено фото от пользователя {message.from_user.id}")
         
-        # Получаем информацию о фото
-        photo = message.photo[-1]  # Берем самое большое фото
-        file_id = photo.file_id
-        file_size = photo.file_size
-        
-        logging.info(f"Информация о фото: file_id={file_id}, size={file_size}")
-        
         # Отправляем сообщение о начале обработки
-        processing_msg = await message.answer("🔍 Анализирую изображение... Пожалуйста, подождите.")
+        processing_msg = await message.answer("🔍 Анализирую изображение...")
         
         try:
             # Получаем URL файла
-            file_info = await bot.get_file(file_id)
-            file_url = file_info.file_path
-            full_url = f"https://api.telegram.org/file/bot{bot_token}/{file_url}"
+            photo = message.photo[-1]
+            file_info = await bot.get_file(photo.file_id)
+            file_url = f"https://api.telegram.org/file/bot{bot_token}/{file_info.file_path}"
             
-            logging.info(f"URL файла: {full_url}")
+            # Используем упрощенный процессор
+            from photo_processor import SimplePhotoProcessor
+            processor = SimplePhotoProcessor()
             
-            # Используем улучшенный экстрактор для анализа изображения
-            from enhanced_test_extractor import extract_medical_tests_from_image
+            result = await processor.process_photo(file_url)
             
-            # Извлекаем структурированные данные анализов
-            extraction_result = await extract_medical_tests_from_image(
-                full_url,
-                "Проанализируй это медицинское изображение и извлеки все анализы с результатами"
-            )
-            
-            if extraction_result.get("success"):
-                # Генерируем описательный анализ на основе структурированных данных
-                analysis_result = await generate_analysis_description(extraction_result)
+            if result["success"]:
+                # Сохраняем в базу данных
+                await save_medical_record(
+                    user_id, 
+                    "image_analysis", 
+                    result["response"], 
+                    "simple_processor"
+                )
                 
-                # Сохраняем структурированные данные в базу
-                await save_structured_tests_from_image(user_id, extraction_result)
+                # Сохраняем структурированные данные
+                if result["structured_data"]:
+                    await save_structured_tests(user_id, result["structured_data"])
+                
+                # Отправляем ответ с использованием безопасной функции
+                from utils import safe_send_message
+                await safe_send_message(
+                    message,
+                    result["response"],
+                    reply_markup=get_feedback_keyboard()
+                )
+                
+                # Удаляем сообщение о обработке
+                await processing_msg.delete()
+                
             else:
-                # Fallback к обычному анализу, если улучшенный не сработал
-                analysis_result = await analyze_image(
-                    full_url,
-                    "Проанализируй это медицинское изображение. Опиши что видишь, какие анализы показаны, их значения и что они означают."
+                await processing_msg.edit_text(
+                    f"❌ {result['error']}\n\n"
+                    "💡 Попробуйте сделать фото более четким или отправьте PDF файл с анализами."
                 )
             
-            # Проверяем дубликаты
-            is_duplicate = await check_duplicate_medical_record_ai_enhanced(
-                user_id, analysis_result, "image_analysis"
-            )
-            
-            if is_duplicate:
-                await processing_msg.edit_text("⚠️ Похожее изображение уже было проанализировано ранее.")
-                return
-            
-            # Сохраняем результат анализа в базу данных
-            await save_medical_record(user_id, "image_analysis", analysis_result, "telegram_photo")
-            
-            # Отправляем результат анализа
-            escaped_analysis = escape_html(analysis_result)
-            await processing_msg.edit_text(
-                f"📊 <b>Анализ медицинского изображения:</b>\n\n{escaped_analysis}",
-                parse_mode="HTML",
-                reply_markup=get_feedback_keyboard()
-            )
-            
-            logging.info(f"Фото успешно проанализировано для пользователя {user_id}")
-            
         except Exception as e:
-            logging.error(f"Ошибка при анализе фото: {e}")
+            logging.error(f"Ошибка при обработке фото: {e}")
             await processing_msg.edit_text(
-                "😔 Не удалось проанализировать изображение. Возможно, формат не поддерживается или произошла ошибка."
+                "😔 Не удалось обработать изображение. Попробуйте еще раз или отправьте PDF файл."
             )
             
     except Exception as e:
         logging.error(f"Ошибка при обработке фото: {e}")
-        await message.answer("Извините, произошла ошибка при обработке изображения. Попробуйте еще раз.")
+        await message.answer("Извините, произошла ошибка. Попробуйте еще раз.")
+
+async def save_structured_tests(user_id: str, tests: List[Dict]):
+    """Сохранение структурированных тестов"""
+    try:
+        for test in tests:
+            test_data = {
+                "user_id": user_id,
+                "test_name": test.get("test_name", ""),
+                "result": test.get("result", ""),
+                "reference_values": test.get("reference_values", ""),
+                "units": test.get("units", ""),
+                "category": test.get("category", ""),
+                "created_at": datetime.now().isoformat()
+            }
+            
+            supabase.table("doc_structured_test_results").insert(test_data).execute()
+            
+    except Exception as e:
+        logging.error(f"Ошибка сохранения структурированных тестов: {e}")
 
 # Обработчик документов (PDF)
 @dp.message(F.document)

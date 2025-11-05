@@ -1,0 +1,70 @@
+{
+  "metrics": [
+    {
+      "document_type": "test",
+      "processing_time": 0.0,
+      "success": true,
+      "extraction_method": "test_method",
+      "tests_extracted": 5,
+      "confidence_score": 0.85,
+      "error": null,
+      "model_provider": null,
+      "model_name": null,
+      "tokens_used": null,
+      "timestamp": "2025-11-06T00:18:21.193433"
+    }
+  ],
+  "statistics": {
+    "total_processed": 1,
+    "successful_processed": 1,
+    "failed_processed": 0,
+    "success_rate": 100.0,
+    "average_processing_time": 0.0,
+    "average_tests_extracted": 5.0,
+    "average_confidence": 0.85,
+    "uptime_minutes": 0.08650060494740804,
+    "by_type": {
+      "test": {
+        "total": 1,
+        "successful": 1,
+        "failed": 0,
+        "avg_time": 0.0,
+        "total_time": 0.0
+      }
+    },
+    "by_method": {
+      "test_method": {
+        "total": 1,
+        "successful": 1,
+        "avg_confidence": 0.85,
+        "total_confidence": 0.85
+      }
+    },
+    "last_updated": "2025-11-06T00:18:21.194456"
+  },
+  "processing_stats": {
+    "total_processed": 1,
+    "successful": 1,
+    "failed": 0,
+    "by_type": {
+      "test": {
+        "total": 1,
+        "successful": 1,
+        "failed": 0,
+        "avg_time": 0.0,
+        "total_time": 0.0
+      }
+    },
+    "by_method": {
+      "test_method": {
+        "total": 1,
+        "successful": 1,
+        "avg_confidence": 0.85,
+        "total_confidence": 0.85
+      }
+    },
+    "total_tests": 5,
+    "total_time": 0.0
+  },
+  "saved_at": "2025-11-06T00:18:21.194456"
+}
